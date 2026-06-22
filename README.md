@@ -1,4 +1,4 @@
-# garmin-raw
+# Garmin-TN-MCP (`garmin-raw`)
 
 Минимальный **сырьевой** доступ к Garmin Connect для тренировочного анализа.
 Один бэкенд (`garminconnect` 0.3.x) обслуживает два фронтенда:
@@ -13,43 +13,78 @@
 
 ## Установка
 
+Требуется Python 3.10+ и [`uv`](https://astral.sh/uv).
+
 ```bash
-git clone <this-repo> garmin-raw && cd garmin-raw
+git clone https://github.com/asilenin/Garmin-TN-MCP.git
+cd Garmin-TN-MCP
 uv sync
 ```
 
-Требуется Python 3.10+ и `uv`.
-
-## 1. Авторизация (один раз)
+### 1. Авторизация (один раз)
 
 ```bash
 uv run garmin-raw-auth
 ```
 
-Введёшь email, пароль и MFA-код. Токены сохранятся в `~/.garminconnect` (формат 0.3.x).
+Введёшь email, пароль и MFA-код. Токены лягут в `~/.garminconnect` (формат 0.3.x).
 Дальше логин не нужен — сервер и экспорт работают по токенам (и не ловят 429 от
-повторных входов). Токены живут долго и сами обновляются; повторить `garmin-raw-auth`
-нужно только если Garmin их инвалидирует.
+повторных входов).
 
-## 2a. Живой MCP в Claude Desktop
+### 2. Подключить MCP к Claude Desktop — одной командой
 
-Добавь в `~/Library/Application Support/Claude/claude_desktop_config.json`
-(подставь полный путь к `uv` — `which uv` — и к этой папке):
+```bash
+uv run garmin-raw-install
+```
+
+Команда сама находит `uv` и путь к этой папке и **аккуратно дописывает** сервер
+`garmin-raw` в `claude_desktop_config.json` — не затирая остальное (preferences и пр.),
+с бэкапом. Кроссплатформенно (macOS/Windows/Linux). Путь можно задать явно:
+
+```bash
+uv run garmin-raw-install /полный/путь/к/Garmin-TN-MCP
+```
+
+Затем **полный перезапуск Claude Desktop** (Cmd+Q на macOS) — появятся 6 тулзов.
+
+<details>
+<summary>Ручная альтернатива (если не хочешь скрипт)</summary>
+
+Добавь в `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/claude_desktop_config.json`), подставив пути:
 
 ```json
 {
   "mcpServers": {
     "garmin-raw": {
       "command": "/Users/<you>/.local/bin/uv",
-      "args": ["--directory", "/path/to/garmin-raw", "run", "garmin-raw-mcp"]
+      "args": ["--directory", "/полный/путь/к/Garmin-TN-MCP", "run", "garmin-raw-mcp"]
     }
   }
 }
 ```
+</details>
 
-Полный перезапуск Claude Desktop (Cmd+Q). Появятся 6 тулзов.
+## Удаление
 
-## 2b. Экспорт для тиража
+```bash
+uv run garmin-raw-uninstall      # убирает garmin-raw из конфига (с бэкапом), остальное не трогает
+```
+
+Перезапусти Claude Desktop. Токены при этом не удаляются — снести их вручную при
+необходимости:
+
+```bash
+rm -rf ~/.garminconnect           # сохранённые токены Garmin
+```
+
+Полностью убрать установку:
+
+```bash
+cd .. && rm -rf Garmin-TN-MCP     # сам репозиторий
+```
+
+## Экспорт для тиража
 
 ```bash
 # весь период
@@ -82,9 +117,11 @@ uv run garmin-raw-export --start 2026-06-20 --end 2026-06-21 \
 
 ## Замечания
 
+- **PR Garmin — это авто-детект самого быстрого сплита**, а не протокольные времена;
+  они могут быть быстрее официальных. Для маркеров формы держи протокольные времена,
+  а garmin-PR используй как ориентир.
 - **Wellness/PR** зовутся через перебор кандидатов-методов: если в твоей версии
   `garminconnect` метод назван иначе, тул вернёт `_error`, не роняя весь ответ.
-  Сверь на первом запуске — при необходимости поправь список имён в `backend.py`.
-- **PII** (имя/ID владельца) вырезается из выгрузок — гигиена для тиража.
+- **PII** (имя/ID владельца) вырезается из выгрузок регистронезависимо — гигиена для тиража.
 - Если MCP молча перестал отвечать — почти всегда это протухшие токены: прогони
   `garmin-raw-auth` заново. One-shot экспорт — устойчивый фолбэк на этот случай.

@@ -16,16 +16,22 @@ TOKENSTORE = os.path.expanduser(os.environ.get("GARMIN_TOKENSTORE", "~/.garminco
 
 # Ключи, выдающие личность владельца — вырезаем при отдаче (гигиена для тиража,
 # чтобы не таскать чужие имена/ID в выгрузках, которые уходят в анализ).
+# Сравнение РЕГИСТРОНЕЗАВИСИМОЕ: Garmin использует непоследовательный регистр
+# (userProfilePK vs userProfilePk vs profileId), поэтому держим ключи в lower-case.
 _PII_KEYS = {
-    "ownerId",
-    "ownerDisplayName",
-    "ownerFullName",
-    "ownerProfileImageUrlSmall",
-    "ownerProfileImageUrlMedium",
-    "ownerProfileImageUrlLarge",
-    "userProfilePk",
-    "userProfileId",
-    "profileId",
+    key.lower()
+    for key in (
+        "ownerId",
+        "ownerDisplayName",
+        "ownerFullName",
+        "ownerProfileImageUrlSmall",
+        "ownerProfileImageUrlMedium",
+        "ownerProfileImageUrlLarge",
+        "userProfilePk",
+        "userProfilePK",
+        "userProfileId",
+        "profileId",
+    )
 }
 
 # Лактат пишется в комментарий активности как "LA:6.1" (возможны запятая и пробелы).
@@ -33,9 +39,9 @@ _LA_RE = re.compile(r"LA[:\s]*([0-9]+(?:[.,][0-9]+)?)", re.IGNORECASE)
 
 
 def strip_pii(obj: Any) -> Any:
-    """Рекурсивно убирает ключи с личностью владельца."""
+    """Рекурсивно убирает ключи с личностью владельца (регистронезависимо)."""
     if isinstance(obj, dict):
-        return {k: strip_pii(v) for k, v in obj.items() if k not in _PII_KEYS}
+        return {k: strip_pii(v) for k, v in obj.items() if k.lower() not in _PII_KEYS}
     if isinstance(obj, list):
         return [strip_pii(v) for v in obj]
     return obj
