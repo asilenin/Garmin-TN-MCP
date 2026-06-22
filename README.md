@@ -1,19 +1,21 @@
 # Garmin-TN-MCP (`garmin-raw`)
 
-Минимальный **сырьевой** доступ к Garmin Connect для тренировочного анализа.
-Один бэкенд (`garminconnect` 0.3.x) обслуживает два фронтенда:
+**English** | [Русский](README.ru.md)
 
-- **MCP-сервер** (`garmin-raw-mcp`) — живой доступ к данным прямо в чате Claude Desktop.
-- **One-shot экспорт** (`garmin-raw-export`) — выгрузка периода в JSON для тиража
-  (атлет/коуч заливает файл в чат).
+Minimal **raw** access to Garmin Connect for training analysis. One backend
+(`garminconnect` 0.3.x) powers two frontends:
 
-Принцип: только сырьё (пульс/каденс/мощность/шаг/высота по кругам, посекундные
-потоки, комментарий-лактат). **Никаких** VO2max / training-effect / device-оценок
-порога — они по методологии отвергаются.
+- **MCP server** (`garmin-raw-mcp`) — live data access inside Claude Desktop chat.
+- **One-shot export** (`garmin-raw-export`) — dumps a date range to JSON for
+  reuse with other athletes (the file is uploaded into a chat).
 
-## Установка
+Principle: raw data only (per-lap HR / cadence / power / stride / elevation,
+per-second streams, the lactate comment). **No** VO2max / training-effect /
+device threshold estimates — those are deliberately excluded.
 
-Требуется Python 3.10+ и [`uv`](https://astral.sh/uv).
+## Install
+
+Requires Python 3.10+ and [`uv`](https://astral.sh/uv).
 
 ```bash
 git clone https://github.com/asilenin/Garmin-TN-MCP.git
@@ -21,107 +23,132 @@ cd Garmin-TN-MCP
 uv sync
 ```
 
-### 1. Авторизация (один раз)
+### 1. Authenticate (once)
 
 ```bash
 uv run garmin-raw-auth
 ```
 
-Введёшь email, пароль и MFA-код. Токены лягут в `~/.garminconnect` (формат 0.3.x).
-Дальше логин не нужен — сервер и экспорт работают по токенам (и не ловят 429 от
-повторных входов).
+Enter email, password and the MFA code. Tokens are saved to `~/.garminconnect`
+(0.3.x format). After that no login is needed — the server and the export run on
+tokens (and avoid 429 rate-limiting from repeated logins).
 
-### 2. Подключить MCP к Claude Desktop — одной командой
+### 2. Connect the MCP to Claude Desktop — one command
 
 ```bash
 uv run garmin-raw-install
 ```
 
-Команда сама находит `uv` и путь к этой папке и **аккуратно дописывает** сервер
-`garmin-raw` в `claude_desktop_config.json` — не затирая остальное (preferences и пр.),
-с бэкапом. Кроссплатформенно (macOS/Windows/Linux). Путь можно задать явно:
+It auto-resolves `uv` and this folder's path and **safely merges** the
+`garmin-raw` server into `claude_desktop_config.json` without overwriting the
+rest (your preferences, etc.), with a backup. Cross-platform (macOS/Windows/Linux).
+You can pass the path explicitly:
 
 ```bash
-uv run garmin-raw-install /полный/путь/к/Garmin-TN-MCP
+uv run garmin-raw-install /full/path/to/Garmin-TN-MCP
 ```
 
-Затем **полный перезапуск Claude Desktop** (Cmd+Q на macOS) — появятся 6 тулзов.
+Then **fully restart Claude Desktop** (Cmd+Q on macOS) — the 6 tools appear.
 
 <details>
-<summary>Ручная альтернатива (если не хочешь скрипт)</summary>
+<summary>Manual alternative (if you prefer not to use the script)</summary>
 
-Добавь в `claude_desktop_config.json` (macOS:
-`~/Library/Application Support/Claude/claude_desktop_config.json`), подставив пути:
+Add to `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "garmin-raw": {
       "command": "/Users/<you>/.local/bin/uv",
-      "args": ["--directory", "/полный/путь/к/Garmin-TN-MCP", "run", "garmin-raw-mcp"]
+      "args": ["--directory", "/full/path/to/Garmin-TN-MCP", "run", "garmin-raw-mcp"]
     }
   }
 }
 ```
 </details>
 
-## Удаление
+## Uninstall
 
 ```bash
-uv run garmin-raw-uninstall      # убирает garmin-raw из конфига (с бэкапом), остальное не трогает
+uv run garmin-raw-uninstall   # removes garmin-raw from the config (with backup), leaves the rest
 ```
 
-Перезапусти Claude Desktop. Токены при этом не удаляются — снести их вручную при
-необходимости:
+Restart Claude Desktop. Tokens are not removed — delete them manually if you want:
 
 ```bash
-rm -rf ~/.garminconnect           # сохранённые токены Garmin
+rm -rf ~/.garminconnect        # saved Garmin tokens
 ```
 
-Полностью убрать установку:
+Remove the whole thing:
 
 ```bash
-cd .. && rm -rf Garmin-TN-MCP     # сам репозиторий
+cd .. && rm -rf Garmin-TN-MCP  # the repository itself
 ```
 
-## Экспорт для тиража
+## Export (for reuse with other athletes)
 
 ```bash
-# весь период
+# whole period
 uv run garmin-raw-export --start 2026-06-01 --end 2026-06-21
 
-# одна активность + посекундные потоки
+# single activity + per-second streams
 uv run garmin-raw-export --start 2026-06-20 --end 2026-06-21 \
     --activity 23321211303 --streams
 ```
 
-Получишь `garmin_export.json` — залей в чат.
+Produces `garmin_export.json` — upload it into a chat.
 
-## Тулзы (одинаковы в MCP и экспорте)
+## Tools (identical in the MCP and the export)
 
-| Тул | Отдаёт |
+| Tool | Returns |
 |---|---|
-| `list_activities(start, end, sport)` | сырые сводки за период (1 запрос) |
-| `get_activity_laps(id)` | пульс/каденс/мощность/шаг/высота **по кругу** (lapDTOs) |
-| `get_activity_streams(id)` | посекундные потоки (HR, каденс, высота, уклон, мощность, шаг, дыхание) |
-| `get_activity_comment(id)` | комментарий активности + распарсенный лактат (`LA:x.x`) |
-| `get_wellness(date)` | сон, HRV, RHR, стресс, Body Battery |
-| `get_personal_records()` | PR по дистанциям |
+| `list_activities(start, end, sport)` | raw activity summaries for a period (1 request) |
+| `get_activity_laps(id)` | HR / cadence / power / stride / elevation **per lap** (lapDTOs) |
+| `get_activity_streams(id)` | per-second streams (HR, cadence, elevation, grade, power, stride, respiration) |
+| `get_activity_comment(id)` | the activity comment + parsed lactate (`LA:x.x`) |
+| `get_wellness(date)` | sleep, HRV, RHR, stress, Body Battery |
+| `get_personal_records()` | personal records by distance |
 
-## Лактат
+## Lactate
 
-Вносится в **комментарий активности** в Garmin Connect строкой вида `LA:6.1`
-(можно с контекстом: `LA:6.6 @rep12`). `get_activity_comment` достаёт поле
-`description` и парсит все значения в `lactate_mmol`. Комментарий тянется лениво —
-только для активностей, реально идущих в анализ, чтобы не удваивать число запросов.
+Write it into the **activity comment** in Garmin Connect as `LA:6.1` (context is
+fine: `LA:6.6 @rep12`). `get_activity_comment` reads the `description` field and
+parses every value into `lactate_mmol`. The comment is fetched lazily — only for
+activities actually under analysis — to avoid doubling the request count.
 
-## Замечания
+## Notes
 
-- **PR Garmin — это авто-детект самого быстрого сплита**, а не протокольные времена;
-  они могут быть быстрее официальных. Для маркеров формы держи протокольные времена,
-  а garmin-PR используй как ориентир.
-- **Wellness/PR** зовутся через перебор кандидатов-методов: если в твоей версии
-  `garminconnect` метод назван иначе, тул вернёт `_error`, не роняя весь ответ.
-- **PII** (имя/ID владельца) вырезается из выгрузок регистронезависимо — гигиена для тиража.
-- Если MCP молча перестал отвечать — почти всегда это протухшие токены: прогони
-  `garmin-raw-auth` заново. One-shot экспорт — устойчивый фолбэк на этот случай.
+- **Garmin PRs are auto-detected fastest splits**, not certified race times; they
+  can be faster than official results. Use certified times as form markers and
+  Garmin PRs only as a hint.
+- **Wellness/PR** methods are resolved by trying candidate names: if your
+  `garminconnect` version renames one, the tool returns `_error` instead of
+  crashing the whole response.
+- **PII** (owner name/ID) is stripped from outputs, case-insensitively — hygiene
+  for shared exports.
+- If the MCP silently stops responding, it's almost always stale tokens: re-run
+  `garmin-raw-auth`. The one-shot export is the robust fallback.
+
+## Garmin disclaimer
+
+This project accesses Garmin Connect through an **unofficial** method (the
+community [`python-garminconnect`](https://github.com/cyberjunky/python-garminconnect)
+library, which logs in with your own credentials). It is **not affiliated with,
+endorsed by, or supported by Garmin**. Your use may be subject to Garmin's Terms
+of Service; you use it **at your own risk**. No warranty is provided (see
+[`LICENSE`](LICENSE)).
+
+## Authorship & AI generation
+
+This project was designed and written by **Claude** (Anthropic's AI assistant)
+during an extended pair-programming session, under the direction, review and
+testing of **Anton Silenin**. The methodology, architecture, debugging and final
+verification against real Garmin data were done collaboratively in conversation:
+the human author initiated the work, made the design decisions, validated every
+step on live data, and is the copyright holder.
+
+AI-generated output carries no separate human authorship under copyright law, so
+it is released under the human author's name (MIT, see [`LICENSE`](LICENSE)). This
+note is here for transparency, not as a license requirement. As with any
+AI-assisted code, review it before relying on it.

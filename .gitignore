@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / virtualenv  (uv.lock остаётся в репозитории ради воспроизводимости установки)
+.venv/
+venv/
+
+# Локальные данные — НИКОГДА не коммитить
+.garminconnect/          # токены Garmin (на самом деле лежат в ~, но на всякий случай)
+garmin_export*.json      # выгрузки активностей
+*.fit                    # экспорт FIT
+
+# Бэкапы конфига от установщика
+*.bak.*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
