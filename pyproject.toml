@@ -1,0 +1,18 @@
+[project]
+name = "garmin-raw"
+version = "0.1.0"
+description = "Минимальный сырьевой доступ к Garmin Connect для тренировочного анализа (MCP + экспорт)"
+requires-python = ">=3.10"
+dependencies = [
+    "garminconnect>=0.3.0",
+    "mcp>=1.2.0",
+]
+
+[project.scripts]
+garmin-raw-auth = "garmin_raw.auth:main"
+garmin-raw-export = "garmin_raw.export:main"
+garmin-raw-mcp = "garmin_raw.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
