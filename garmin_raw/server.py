@@ -44,6 +44,12 @@ def get_activity_comment(activity_id: int) -> str:
 
 
 @mcp.tool()
+def get_activity_lactate(activity_id: int) -> str:
+    """Числовые отметки лактата из developer-поля (TN Splits View): [(время, ммоль, круг)]."""
+    return _dump(_src.get_activity_lactate(activity_id))
+
+
+@mcp.tool()
 def get_wellness(date: str) -> str:
     """Восстановление за день: сон, HRV, RHR, стресс, Body Battery. Дата 'YYYY-MM-DD'."""
     return _dump(_src.get_wellness(date))

@@ -107,6 +107,7 @@ Produces `garmin_export.json` — upload it into a chat.
 | `get_activity_laps(id)` | HR / cadence / power / stride / elevation **per lap** (lapDTOs) |
 | `get_activity_streams(id)` | per-second streams (HR, cadence, elevation, grade, power, stride, respiration) |
 | `get_activity_comment(id)` | the activity comment + parsed lactate (`LA:x.x`) |
+| `get_activity_lactate(id)` | numeric lactate marks from the TN Splits View developer field: `[(time, mmol, lap)]` |
 | `get_wellness(date)` | sleep, HRV, RHR, stress, Body Battery |
 | `get_personal_records()` | personal records by distance |
 
@@ -116,6 +117,12 @@ Write it into the **activity comment** in Garmin Connect as `LA:6.1` (context is
 fine: `LA:6.6 @rep12`). `get_activity_comment` reads the `description` field and
 parses every value into `lactate_mmol`. The comment is fetched lazily — only for
 activities actually under analysis — to avoid doubling the request count.
+
+Numeric lactate (new): values logged from the watch via the **TN Splits View** ConnectIQ
+field live in the activity **streams**, not the comment. `get_activity_lactate` reads them —
+the field is matched by `developerFieldNumber == 1` (the per-stream index is not stable, and
+the appID is zeroed on sideload / becomes `7c294f6c-…` after publishing). Any sample > 0 is a
+mark; 0 means no measurement. Each mark is attributed to the nearest lap.
 
 ## Notes
 

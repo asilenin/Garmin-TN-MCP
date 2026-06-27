@@ -37,6 +37,18 @@ _PII_KEYS = {
 # Лактат пишется в комментарий активности как "LA:6.1" (возможны запятая и пробелы).
 _LA_RE = re.compile(r"LA[:\s]*([0-9]+(?:[.,][0-9]+)?)", re.IGNORECASE)
 
+# Лактат теперь пишется числовым ConnectIQ developer-полем (TN Splits View) в потоках.
+# Поле идентифицируется по developerFieldNumber == 1. appID НЕ надёжен: при sideload
+# Garmin отдаёт его нулями; после публикации станет 7c294f6c-... Индекс поля
+# (metricsIndex) между активностями НЕ стабилен — матчим только по devField.
+_LACTATE_DEV_FIELD = 1
+_LACTATE_APPIDS = {
+    "00000000-0000-0000-0000-000000000000",  # sideload (Garmin зануляет appID)
+    "7c294f6c-58ec-4064-bcfe-342189d548f0",  # TN Splits View после публикации
+}
+# Поле Stryd сидит рядом под этим appID (номера 0/8/9) — его исключаем явно.
+_STRYD_APPID = "18fb2cf0-1a4b-430d-ad66-988c847421f4"
+
 
 def strip_pii(obj: Any) -> Any:
     """Рекурсивно убирает ключи с личностью владельца (регистронезависимо)."""
@@ -131,6 +143,90 @@ class GarminSource:
             "description": desc,
             "lactate_mmol": parse_lactate(desc),
         }
+
+    def _lap_bounds(self, activity_id: int):
+        """[(start_ms, end_ms, lap_no)] по кругам — для привязки проб к отрезку.
+
+        Best-effort: если круги не достанутся, вернёт пустой список (тул отдаст
+        пробы без привязки, а не упадёт).
+        """
+        try:
+            laps = self.client.get_activity_splits(activity_id).get("lapDTOs", [])
+        except Exception:  # noqa: BLE001
+            return []
+        bounds = []
+        for i, lap in enumerate(laps, 1):
+            start = lap.get("startTimeGMT")
+            dur = lap.get("elapsedDuration") or lap.get("duration") or 0
+            if not start:
+                continue
+            # startTimeGMT приходит как 'YYYY-MM-DDTHH:MM:SS.0' (UTC)
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromisoformat(start.replace("Z", "")).replace(
+                    tzinfo=timezone.utc).timestamp() * 1000
+            except Exception:  # noqa: BLE001
+                continue
+            bounds.append((ts, ts + dur * 1000, i))
+        return bounds
+
+    @staticmethod
+    def _lap_for(bounds, ts):
+        if ts is None:
+            return None
+        for start, end, no in bounds:
+            if start <= ts < end:
+                return no
+        return None
+
+    def get_activity_lactate(self, activity_id: int) -> dict:
+        """Числовые отметки лактата из ConnectIQ developer-поля (TN Splits View).
+
+        Поле ищется по developerFieldNumber == 1 (индекс между активностями не
+        стабилен; appID при sideload нулевой, после публикации 7c294f6c). Отметкой
+        считается любой сэмпл со значением > 0; нули = «нет замера». Каждая проба
+        привязывается к ближайшему кругу по таймстампу.
+        """
+        streams = self.client.get_activity_details(activity_id)
+        descs = streams.get("metricDescriptors", [])
+        lact_idx = ts_idx = dist_idx = None
+        for m in descs:
+            key = m.get("key")
+            if key == "directTimestamp":
+                ts_idx = m["metricsIndex"]
+            elif key == "sumDistance":
+                dist_idx = m["metricsIndex"]
+            appid = m.get("appID")
+            if (m.get("developerFieldNumber") == _LACTATE_DEV_FIELD
+                    and appid != _STRYD_APPID
+                    and (appid in _LACTATE_APPIDS or appid is None)):
+                lact_idx = m["metricsIndex"]
+
+        if lact_idx is None:
+            return {
+                "activity_id": activity_id,
+                "error": "лактатное поле (developerFieldNumber 1) не найдено в потоках",
+                "points": [],
+            }
+
+        bounds = self._lap_bounds(activity_id)
+        points = []
+        for row in streams.get("activityDetailMetrics", []):
+            mv = row.get("metrics", [])
+            if len(mv) <= lact_idx:
+                continue
+            val = mv[lact_idx]
+            if val is None or val <= 0:  # 0 = нет замера
+                continue
+            ts = mv[ts_idx] if (ts_idx is not None and len(mv) > ts_idx) else None
+            dist = mv[dist_idx] if (dist_idx is not None and len(mv) > dist_idx) else None
+            points.append({
+                "timestamp_ms": ts,
+                "mmol": round(float(val), 2),
+                "distance_m": round(dist) if dist else None,
+                "lap": self._lap_for(bounds, ts),
+            })
+        return {"activity_id": activity_id, "count": len(points), "points": points}
 
     def get_wellness(self, date: str) -> dict:
         """Восстановление за день: сон, HRV, RHR, стресс, Body Battery.
