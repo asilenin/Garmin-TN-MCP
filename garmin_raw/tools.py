@@ -147,20 +147,55 @@ def get_activity_full(slug: str, activity_id: int) -> dict:
     return {**cat, "enriched": True, **enr}
 
 
+def get_period_aggregates(slug: str, period_key: Optional[str] = None) -> dict:
+    """Кросс-агрегаты по периодам (этап 5, §3.5). Якорь-нейтральные, БЕЗ имён/зон.
+
+    Без period_key — ВСЕ периоды (для динамики формы §5.4: сравнение кварталов).
+    С period_key (напр. '2026-Q2') — один период.
+
+    ВАЖНО для LLM при чтении (демаркация — суждения здесь, не в данных):
+    - pace_by_hr_grid by_source: если hr_sources={unknown:1.0} в provenance — источник
+      НЕ разложен, пульсовая динамика через годы НЕДОСТОВЕРНА (§5.4/§1.7), пометь это.
+      unknown = «не знаю, возможно менялся источник», НЕ «однородно».
+    - decoupling.by_delta_pace: бины Δpace — ОСИ, не вердикт. Δpace≈0 → дрейф базы
+      (decoupling осмыслен); большой Δpace → прогрессив (decoupling = разгон, не дрейф,
+      не читай как «база уехала»). Граница — твоя, не зашита.
+    - имена/зоны/пороги (easy/threshold, intensity_distribution) — накладываешь ТЫ.
+    """
+    with Store(profiles.resolve(slug).db_path) as st:
+        av = st.meta_get("algo_version")
+        if av is None:
+            return {"error": "версия не определена"}
+        if period_key:
+            agg = st.get_aggregate(period_key, av)
+            if agg is None:
+                return {"period_key": period_key, "error": "период не агрегирован"}
+            agg.pop("computed_at", None)
+            return agg
+        periods = st.all_aggregates(av)
+        for p in periods:
+            p.pop("computed_at", None)
+        return {"algo_version": av, "n_periods": len(periods), "periods": periods}
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
-        print("usage: python tools.py <slug> <index|compact|full> [activity_id|filters]")
+        print("usage: python tools.py <slug> <index|compact|full|aggregates> [arg]")
         sys.exit(1)
     slug, cmd = sys.argv[1], sys.argv[2]
     if cmd == "index":
-        # пример: python tools.py anton index sport=running max_hr_min=185 limit=10
+        # пример: python tools.py <slug> index sport=running max_hr_min=185 limit=10
         kw = {}
         for arg in sys.argv[3:]:
             if "=" in arg:
                 k, v = arg.split("=", 1)
                 kw[k] = v
         print(json.dumps(query_index(slug, **kw), ensure_ascii=False, indent=2))
+    elif cmd == "aggregates":
+        # python tools.py <slug> aggregates [period_key]
+        pk = sys.argv[3] if len(sys.argv) > 3 else None
+        print(json.dumps(get_period_aggregates(slug, pk), ensure_ascii=False, indent=2))
     elif cmd == "compact":
         print(json.dumps(get_activity_compact(slug, int(sys.argv[3])),
                          ensure_ascii=False, indent=2))

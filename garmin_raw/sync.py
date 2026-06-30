@@ -402,6 +402,24 @@ if __name__ == "__main__":
         sys.stdout.flush()
         os._exit(0)
 
+    if len(sys.argv) > 2 and sys.argv[2] == "aggregate":
+        # python sync.py <slug> aggregate — кросс-агрегаты по периодам (этап 5).
+        # Офлайн, без сети: читает только enriched + каталог (не streams).
+        import profiles as _pf
+        from aggregate import aggregate_profile
+        print(f"агрегация профиля {slug} по периодам (из enriched, без сети)...")
+        res = aggregate_profile(slug, str(_pf.resolve(slug).db_path))
+        print("-" * 60)
+        print(f"версия: {res['algo_version']}")
+        print(f"периодов: {len(res['periods'])}")
+        for pk in sorted(res["periods"]):
+            s = res["periods"][pk]
+            print(f"  {pk}: активностей {s['activities']}, обогащено {s['enriched']}, "
+                  f"max_hr_acc {s['max_hr_acc']}, decoupling {s['decoupling_n']}, "
+                  f"recovery-событий {s['recovery_events']}")
+        sys.stdout.flush()
+        os._exit(0)
+
     if len(sys.argv) > 2 and sys.argv[2] == "enrich":
         # python sync.py <slug> enrich [limit]
         limit = int(sys.argv[3]) if len(sys.argv) > 3 else 20

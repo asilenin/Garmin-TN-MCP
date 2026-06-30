@@ -384,6 +384,62 @@ class Store:
                 out[k] = json.loads(out[k])
         return out
 
+    # ------------------------------------------------------------------ #
+    # Агрегаты period_aggregates (версионировано, §3.5)
+    # ------------------------------------------------------------------ #
+    _AGG_JSON_COLS = ("volume_7d", "volume_28d", "decoupling", "hr_recovery",
+                      "pace_by_hr_grid", "gct_by_pace_grid", "provenance")
+
+    def put_aggregate(self, period_key: str, algo_version: str, agg: dict) -> None:
+        """Записать строку period_aggregates. JSON-поля сериализуются, max_hr — int."""
+        row = {
+            "period_key": period_key,
+            "algo_version": algo_version,
+            "max_hr_accumulated": agg.get("max_hr_accumulated"),
+            "computed_at": _iso_now(),
+        }
+        for k in self._AGG_JSON_COLS:
+            row[k] = json.dumps(agg.get(k), ensure_ascii=False)
+        cols = ("period_key", "algo_version", "max_hr_accumulated", "computed_at",
+                *self._AGG_JSON_COLS)
+        ph = ",".join("?" for _ in cols)
+        upd = ",".join(f"{c}=excluded.{c}" for c in cols
+                       if c not in ("period_key", "algo_version"))
+        self.conn.execute(
+            f"INSERT INTO period_aggregates ({','.join(cols)}) VALUES ({ph}) "
+            f"ON CONFLICT(period_key,algo_version) DO UPDATE SET {upd}",
+            tuple(row[c] for c in cols),
+        )
+        self.conn.commit()
+
+    def get_aggregate(self, period_key: str, algo_version: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM period_aggregates WHERE period_key=? AND algo_version=?",
+            (period_key, algo_version),
+        ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        for k in self._AGG_JSON_COLS:
+            if out.get(k):
+                out[k] = json.loads(out[k])
+        return out
+
+    def all_aggregates(self, algo_version: str) -> list[dict]:
+        """Все периоды одной версии, по возрастанию period_key (для динамики §5.4)."""
+        rows = self.conn.execute(
+            "SELECT * FROM period_aggregates WHERE algo_version=? ORDER BY period_key",
+            (algo_version,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            for k in self._AGG_JSON_COLS:
+                if d.get(k):
+                    d[k] = json.loads(d[k])
+            out.append(d)
+        return out
+
     def activity_ids(self, *, start: Optional[str] = None, end: Optional[str] = None,
                      sport: Optional[str] = None, limit: Optional[int] = None,
                      order_desc: bool = True) -> list[int]:
