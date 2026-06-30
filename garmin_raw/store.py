@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Версия СХЕМЫ БД (структура таблиц). НЕ путать с ALGO_VERSION (версия формул).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +170,20 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE activity_enriched ADD COLUMN pace_by_hr_bucket TEXT;
         """,
     ),
+    (
+        3,
+        """
+        -- Миграция v3 (этап 5, enrich-0.5.0). Две колонки per-activity под
+        -- decoupling и hr_recovery — streams/laps-зависимые поля для aggregate.
+        -- ALTER ADD COLUMN: метаданные-операция, НЕ переписывает таблицу, НЕ трогает
+        -- activity_raw. Старые версии строк (0.2.2…0.4.0) получают NULL и остаются
+        -- валидными; новые 0.5.0 пишутся рядом под своим ключом (recompute resumable).
+        -- decoupling: ratio (2-я пол./1-я) на ровном темпе; hr_recovery: падение HR
+        -- после рабочих кругов. Оба БЕЗ имён/якорей (§3.5) — суждение LLM.
+        ALTER TABLE activity_enriched ADD COLUMN decoupling TEXT;
+        ALTER TABLE activity_enriched ADD COLUMN hr_recovery TEXT;
+        """,
+    ),
 ]
 
 
@@ -293,6 +307,7 @@ class Store:
         "pace_variance", "hr_variance", "biomech_by_pace", "lactate_marks",
         "elevation", "confidence", "computed_at",
         "biomech_by_pace_bucket", "pace_by_hr_bucket",
+        "decoupling", "hr_recovery",
     )
 
     def has_enriched(self, activity_id: int, algo_version: str) -> bool:
@@ -324,6 +339,8 @@ class Store:
             "computed_at": _iso_now(),
             "biomech_by_pace_bucket": json.dumps(enriched.get("biomech_by_pace_bucket"), ensure_ascii=False),
             "pace_by_hr_bucket": json.dumps(enriched.get("pace_by_hr_bucket"), ensure_ascii=False),
+            "decoupling": json.dumps(enriched.get("decoupling"), ensure_ascii=False),
+            "hr_recovery": json.dumps(enriched.get("hr_recovery"), ensure_ascii=False),
         }
         cols = self._ENR_COLS
         ph = ",".join("?" for _ in cols)
@@ -361,7 +378,8 @@ class Store:
         out = dict(row)
         for k in ("hr_histogram", "pace_histogram", "clusters", "biomech_by_pace",
                   "lactate_marks", "elevation", "confidence",
-                  "biomech_by_pace_bucket", "pace_by_hr_bucket"):
+                  "biomech_by_pace_bucket", "pace_by_hr_bucket",
+                  "decoupling", "hr_recovery"):
             if out.get(k):
                 out[k] = json.loads(out[k])
         return out

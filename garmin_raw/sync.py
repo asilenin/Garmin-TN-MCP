@@ -268,9 +268,14 @@ def enrich_batch(slug: str, *, limit: int = 200, start: Optional[str] = None,
                     craw = st.get_raw(aid, "comment")
                     if isinstance(craw, dict):
                         comment = craw.get("lactate_mmol", []) or []
+                # laps — второе несущее сырьё (структура кругов): нужно hr_recovery.
+                # Кэшированы для всех (долг закрыт); offline берём из БД, online —
+                # докачиваем выше при первом скачивании streams.
+                laps = st.get_raw(aid, "laps")
                 # обогащение
                 enriched = enrich_activity(
-                    stream, lactate_watch_points=lact, lactate_comment_values=comment
+                    stream, laps=laps,
+                    lactate_watch_points=lact, lactate_comment_values=comment,
                 )
                 st.put_enriched(aid, enriched)
                 rep.enriched_ok += 1
