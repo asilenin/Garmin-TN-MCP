@@ -40,12 +40,15 @@ import numpy as np
 #        выводятся на чтении (не фиксируются). Подробности — в _suffstat_cell.
 # 0.5.0: per-activity decoupling и hr_recovery (streams/laps-зависимые поля для
 #        aggregate, этап 5). laps добавлены в сигнатуру как второе несущее сырьё.
-#        decoupling — ratio (2-я пол./1-я) на ровном темпе (определимость = низкая
-#        дисперсия, не порог «длинная»). hr_recovery — падение HR после рабочих
-#        кругов (быстрее медианы темпа), структурное окно + робастные края из
-#        streams (медиана N сек, не maxHR-пик). no_laps vs no_fast_laps различаются.
-#        intensityType игнорируется (чужой ярлык). Без имён — суждение LLM.
-ALGO_VERSION = "enrich-0.5.0"
+#        [0.5.0 имел порог pace_not_steady — отсекал 88% (порог на континууме,
+#        §2.5). Заменено в 0.5.1.]
+# 0.5.1: decoupling без порога ровности — считается ВСЕГДА (континуум pace_variance,
+#        порог произволен §2.5; «ровность» — суждение LLM §3.5.2). Самомаркируется
+#        ПАРОЙ фактов: pace_variance (ловит пилу) + pace_1st_half/pace_2nd_half (ловят
+#        прогрессив — direction, который variance не выдаёт; иначе decoupling врёт
+#        правдоподобно на разгоне, путая его с дрейфом базы). hr_recovery: различены
+#        no_laps / single_lap / no_fast_laps (три факта, не схлопывать).
+ALGO_VERSION = "enrich-0.5.1"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -125,12 +128,11 @@ PACE_BIOMECH_BUCKET_S_PER_KM = 15  # ширина темп-бакета биом
 HR_PACE_BUCKET_BPM = 5             # ширина HR-бакета для pace_by_hr (как hr-гистограмма)
 
 # --- Параметры decoupling / hr_recovery (enrich-0.5.0; ТЗ §3.5, МЕТОД §5.4) -----
-# decoupling — механический ratio (2-я половина / 1-я) по РОВНЫМ тренировкам.
-#   Определимость (§3.5.2) = низкая дисперсия темпа (ровный темп, чтобы половины
-#   были сравнимы), НЕ порог «длинная» (ни абсолютный 90мин — §2.5, ни относительный
-#   — суждение). На пиле decoupling не определён. duration_s прикладывается фактом.
-#   Без имени «база держит/едет» — это LLM.
-DECOUPLING_MAX_PACE_VARIANCE = 400.0  # порог «ровный темп» (сек/км)²; старт, на калибровку
+# decoupling — механический ratio (2-я половина / 1-я). БЕЗ порога ровности:
+#   распределение pace_variance непрерывно (нет «ровные/рваные»), порог произволен
+#   (§2.5); «достаточно ли ровная» — суждение LLM (§3.5.2). Считается всегда, где
+#   есть две половины. Самомаркировка — парой фактов: pace_variance (ловит пилу) +
+#   pace_1st/2nd_half (ловят прогрессив, который variance не выдаёт). Без имени.
 # hr_recovery — падение HR после кругов быстрее медианы темпа. Структурное окно
 #   (границы кругов из laps, НЕ зашитые 60с — §2.5), робастные края из streams
 #   (медиана HR последних N секунд, НЕ maxHR-пик — §2.4: единственная точка хрупка).
@@ -140,6 +142,8 @@ DECOUPLING_MAX_PACE_VARIANCE = 400.0  # порог «ровный темп» (с
 #   кругов разной длины — суждение LLM §3.5.2, не нормировка коннектора).
 #   intensityType Garmin (INTERVAL/REST) ИГНОРИРУЕТСЯ — чужой ярлык (§2.2);
 #   рабочие круги отбираются механически по темпу.
+#   Различаем no_laps (нет в кэше) / single_lap (один круг, структуры нет) /
+#   no_fast_laps (круги есть, быстрее медианы нет) — три РАЗНЫХ факта (§3.5.2).
 HR_RECOVERY_EDGE_WINDOW_S = 8.0   # окно медианы края recovery (сек); старт 5-10, на калибровку
 
 # Ключи потока
@@ -420,48 +424,65 @@ def _bucketize(axis: np.ndarray, dt: np.ndarray, bucket: float,
 
 
 def _decoupling(hr_mv: np.ndarray, pace_mv: np.ndarray, dt_mv: np.ndarray,
-                pace_variance: Optional[float], duration_s: float) -> Optional[dict]:
-    """Механический ratio пульс/темп: (2-я половина) / (1-я) по moving-времени.
+                pace_variance: Optional[float], duration_s: float) -> dict:
+    """Механический ratio пульс/скорость: (2-я половина) / (1-я) по moving-времени.
 
-    ОПРЕДЕЛИМОСТЬ (§3.5.2), не значимость: считается только на РОВНОМ темпе (низкая
-    pace_variance) — нужен стабильный темп, чтобы две половины были сравнимы. На
-    пиле/интервалке темп не ровный → половины несравнимы → decoupling НЕ определён
-    (None, reason). Это факт сигнала, НЕ суждение «длинная ли тренировка показательна»
-    (то — LLM по duration_s). Порог «длинная» НЕ зашит (§2.5).
+    БЕЗ ПОРОГА ровности (решение этапа 5). Раньше считался только при низкой
+    pace_variance — но распределение pace_variance НЕПРЕРЫВНО (нет провала
+    «ровные/рваные»), любой порог на континууме произволен (§2.5), а «достаточно ли
+    ровная тренировка, чтобы decoupling осмыслен» — ЗНАЧИМОСТЬ, суждение LLM (§3.5.2).
+    Поэтому decoupling считается ВСЕГДА, где есть две половины с данными
+    (определимость механическая), а ровность судит LLM по приложенным фактам.
 
-    ratio половины = средневзвешенный по времени HR / средневзвешенный темп. Растёт
-    во 2-й половине = пульс уехал вверх при том же темпе. Знак/величину НЕ называем
-    «база держит/едет» — это имя, его вешает LLM. Коннектор отдаёт число + duration_s.
+    САМОМАРКИРОВКА требует ДВУХ фактов, не одного — pace_variance НЕДОСТАТОЧЕН:
+    - pace_variance ловит ПИЛУ (скачки темпа): высокий → LLM не берёт decoupling;
+    - НО прогрессив (плавный разгон 5:30→4:30) даёт УМЕРЕННЫЙ variance и при этом
+      2-я половина систематически быстрее → decoupling меряет РАЗНИЦУ ТЕМПА, не дрейф
+      пульса, и врёт правдоподобно («база уехала», хотя человек просто ускорился).
+      variance это НЕ выдаёт (прогрессив направленный, не шумный).
+    - поэтому отдаём ещё pace_1st_half/pace_2nd_half: если 2-я заметно быстрее, LLM
+      видит «темп между половинами не держался → decoupling про разгон, не дрейф».
+    Разброс (пила) + тренд (прогрессив) — две ортогональные оси артефакта. Коннектор
+    отдаёт обе как факты, НЕ отсекает; «осмыслен ли decoupling как дрейф» — LLM.
+
+    value = ratio HR-на-скорость 2-й половины к 1-й. Рост = пульс выше при той же
+    скорости. Имя «база держит/едет» НЕ вешаем — это LLM.
     """
-    if pace_variance is None:
-        return {"value": None, "reason": "no_moving_data", "duration_s": round(duration_s, 1)}
-    if pace_variance > DECOUPLING_MAX_PACE_VARIANCE:
-        return {"value": None, "reason": "pace_not_steady", "duration_s": round(duration_s, 1)}
+    base = {"value": None, "pace_1st_half": None, "pace_2nd_half": None,
+            "pace_variance": pace_variance, "duration_s": round(duration_s, 1)}
     good = ~np.isnan(hr_mv) & ~np.isnan(pace_mv) & (pace_mv > 0)
     hr_g, pace_g, dt_g = hr_mv[good], pace_mv[good], dt_mv[good]
     if hr_g.size < 4 or dt_g.sum() <= 0:
-        return {"value": None, "reason": "too_few_points", "duration_s": round(duration_s, 1)}
+        return {**base, "reason": "too_few_points"}
     # делим по накопленному ВРЕМЕНИ пополам (не по числу точек — поток прорежен)
     cum = np.cumsum(dt_g)
     half_t = cum[-1] / 2.0
     first = cum <= half_t
     second = ~first
     if not first.any() or not second.any():
-        return {"value": None, "reason": "too_few_points", "duration_s": round(duration_s, 1)}
-    def wratio(sel):
-        w = dt_g[sel]
-        hr_w = np.sum(hr_g[sel] * w) / w.sum()
-        # темп в сек/км: меньше = быстрее. ratio = HR на единицу СКОРОСТИ (1/pace),
-        # чтобы «пульс растёт при том же темпе» давало рост ratio. Используем hr*pace
-        # как прокси нагрузки на скорость: при фиксированном темпе ratio ∝ hr.
-        pace_w = np.sum(pace_g[sel] * w) / w.sum()
-        return hr_w / (1000.0 / pace_w)   # hr / (скорость в м/с-эквиваленте)
-    r1, r2 = wratio(first), wratio(second)
+        return {**base, "reason": "too_few_points"}
+
+    def whr(sel):  # взвешенный по времени HR половины
+        w = dt_g[sel]; return float(np.sum(hr_g[sel] * w) / w.sum())
+    def wpace(sel):  # взвешенный по времени темп половины (сек/км)
+        w = dt_g[sel]; return float(np.sum(pace_g[sel] * w) / w.sum())
+
+    hr1, hr2 = whr(first), whr(second)
+    p1, p2 = wpace(first), wpace(second)
+    # ratio = HR / скорость(м/с). pace сек/км → скорость = 1000/pace.
+    r1 = hr1 / (1000.0 / p1)
+    r2 = hr2 / (1000.0 / p2)
     if r1 <= 0:
-        return {"value": None, "reason": "too_few_points", "duration_s": round(duration_s, 1)}
+        return {**base, "reason": "too_few_points"}
     decoup = (r2 - r1) / r1
-    return {"value": round(float(decoup), 4), "reason": "ok",
-            "duration_s": round(duration_s, 1)}
+    return {
+        "value": round(float(decoup), 4),
+        "pace_1st_half": round(p1, 1),   # факт: темп половин — ловит прогрессив
+        "pace_2nd_half": round(p2, 1),   # (2-я заметно быстрее → decoupling про разгон, не дрейф)
+        "pace_variance": pace_variance,  # факт: пила или нет
+        "duration_s": round(duration_s, 1),
+        "reason": "ok",
+    }
 
 
 def _hr_recovery(laps: Optional[dict], ts: np.ndarray, hr_clean: np.ndarray,
@@ -489,8 +510,13 @@ def _hr_recovery(laps: Optional[dict], ts: np.ndarray, hr_clean: np.ndarray,
     if not laps:
         return {"events": [], "reason": "no_laps"}
     lap_list = laps.get("lapDTOs") or []
-    if len(lap_list) < 2:
+    if len(lap_list) == 0:
         return {"events": [], "reason": "no_laps"}
+    if len(lap_list) < 2:
+        # один круг = непрерывный бег без разметки. laps ЕСТЬ, но структуры для
+        # recovery нет. Это НЕ «нет данных» (no_laps, чинится дозакачкой) — это
+        # честная структурная неопределимость, как no_fast_laps (§3.5.2 — различаем).
+        return {"events": [], "reason": "single_lap"}
 
     # границы кругов по wall-clock из startTimeGMT + duration. Если нет — пробуем
     # восстановить по накоплению duration от ts[0].
@@ -510,7 +536,8 @@ def _hr_recovery(laps: Optional[dict], ts: np.ndarray, hr_clean: np.ndarray,
             continue
         bounds.append({"dur": float(dur), "pace": float(lp_pace)})
     if len(bounds) < 2:
-        return {"events": [], "reason": "no_laps"}
+        # круги есть, но <2 с валидной длительностью/скоростью — структуры нет
+        return {"events": [], "reason": "single_lap"}
 
     paces = np.array([b["pace"] for b in bounds])
     med_pace = float(np.median(paces))
@@ -719,7 +746,8 @@ def enrich_activity(
             "biomech_by_pace": {},
             "biomech_by_pace_bucket": {},
             "pace_by_hr_bucket": {},
-            "decoupling": {"value": None, "reason": "no_stream", "duration_s": None},
+            "decoupling": {"value": None, "pace_1st_half": None, "pace_2nd_half": None,
+                           "pace_variance": None, "duration_s": None, "reason": "no_stream"},
             "hr_recovery": {"events": [], "reason": "no_stream"},
             "lactate_marks": None,
             "elevation": {"gain_m": None, "loss_m": None},
@@ -901,14 +929,19 @@ if __name__ == "__main__":
         assert "gct" in any_cell, "формат бакета биомеханики: gct/vert_ratio/stride"
         assert any_cell["gct"] is None, "без датчика gct в бакете = None (нет данных)"
 
-    # --- enrich-0.5.0: decoupling ---
-    # основной поток (быстро→стоянка→трусца) НЕ ровный по темпу → decoupling не определён
+    # --- enrich-0.5.0: decoupling (БЕЗ порога — считается всегда, факты для LLM) ---
+    # рваный поток (быстро→стоянка→трусца): decoupling ВСЁ РАВНО считается (нет порога),
+    # но pace_variance высокий — самомаркирует пилу, LLM не возьмёт.
     dec = res["decoupling"]
-    assert dec["value"] is None and dec["reason"] == "pace_not_steady", \
-        f"рваный темп → decoupling не определён, got {dec}"
-    assert dec["duration_s"] is not None, "duration_s прикладывается фактом даже когда value=None"
+    assert dec["reason"] == "ok", f"decoupling считается всегда где есть половины, got {dec['reason']}"
+    assert dec["value"] is not None, "value есть (порога нет)"
+    assert dec["pace_variance"] is not None, "pace_variance едет фактом (ловит пилу)"
+    assert dec["pace_1st_half"] is not None and dec["pace_2nd_half"] is not None, \
+        "темпы половин едут фактом (ловят прогрессив)"
+    assert dec["duration_s"] is not None
 
-    # decoupling на РОВНОМ потоке: ровный темп, пульс уезжает вверх во 2-й половине
+    # РОВНЫЙ поток, пульс вверх во 2-й половине при ТОМ ЖЕ темпе → честный дрейф базы.
+    # pace_1st ≈ pace_2nd (темп держался) → LLM читает decoupling как дрейф.
     n2 = 600
     speed2 = np.full(n2, 3.0) + rng.normal(0, 0.02, n2)   # ровный темп ~5:33/км
     hr2 = np.concatenate([np.full(300, 150.0), np.full(300, 162.0)]) + rng.normal(0, 1, n2)
@@ -917,15 +950,31 @@ if __name__ == "__main__":
         "metricDescriptors": [md("directTimestamp", 0), md("directSpeed", 1), md("directHeartRate", 2)],
         "activityDetailMetrics": [{"metrics": [ts2[k], speed2[k], hr2[k]]} for k in range(n2)],
     }
-    res2 = enrich_activity(stream2)
-    dec2 = res2["decoupling"]
-    assert dec2["reason"] == "ok", f"ровный темп → decoupling определён, got {dec2}"
-    assert dec2["value"] > 0, f"пульс вверх при том же темпе → decoupling > 0, got {dec2['value']}"
+    dec2 = enrich_activity(stream2)["decoupling"]
+    assert dec2["reason"] == "ok" and dec2["value"] > 0, f"дрейф базы → decoupling > 0, got {dec2}"
+    assert abs(dec2["pace_1st_half"] - dec2["pace_2nd_half"]) < 15, \
+        f"на честном дрейфе темп половин ≈ равен, got {dec2['pace_1st_half']} vs {dec2['pace_2nd_half']}"
 
-    # --- enrich-0.5.0: hr_recovery ---
-    # без laps → no_laps (отличается от no_fast_laps)
-    assert res["hr_recovery"]["reason"] == "no_laps", "без laps → reason=no_laps"
+    # ПРОГРЕССИВ: разгон 2-й половины при стабильном HR. decoupling вернёт число,
+    # НО pace_2nd заметно быстрее pace_1st → самомаркируется как разгон, не дрейф.
+    speed3 = np.concatenate([np.full(300, 2.7), np.full(300, 3.6)]) + rng.normal(0, 0.02, n2)  # 6:10→4:38
+    hr3 = np.full(n2, 155.0) + rng.normal(0, 1, n2)   # пульс стабилен
+    stream3 = {
+        "metricDescriptors": [md("directTimestamp", 0), md("directSpeed", 1), md("directHeartRate", 2)],
+        "activityDetailMetrics": [{"metrics": [ts2[k], speed3[k], hr3[k]]} for k in range(n2)],
+    }
+    dec3 = enrich_activity(stream3)["decoupling"]
+    assert dec3["pace_2nd_half"] < dec3["pace_1st_half"] - 30, \
+        f"прогрессив: 2-я половина заметно быстрее → видно в фактах, got {dec3['pace_1st_half']} vs {dec3['pace_2nd_half']}"
+    # ключевое: факты РАЗЛИЧАЮТ дрейф (dec2: темп равен) от прогрессива (dec3: темп разный)
+    # хотя оба могут дать ненулевой value. Без pace_1st/2nd LLM их не отличил бы.
 
+    # --- enrich-0.5.0: hr_recovery (no_laps / single_lap / no_fast_laps различаются) ---
+    assert res["hr_recovery"]["reason"] == "no_laps", "без laps → no_laps"
+    # один круг → single_lap (НЕ no_laps: laps есть, структуры нет)
+    single = enrich_activity(stream_r if False else stream2, laps={"lapDTOs": [{"duration": 600.0, "averageSpeed": 3.0}]})
+    assert single["hr_recovery"]["reason"] == "single_lap", \
+        f"один круг → single_lap, не no_laps, got {single['hr_recovery']['reason']}"
     # с laps: рабочий круг (быстрый) → восстановительный (медленный), HR падает
     # строю поток: круг1 работа 100с быстро HR175, круг2 восстановление 100с медленно HR130
     nr = 200
