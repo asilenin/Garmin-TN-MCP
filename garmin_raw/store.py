@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Версия СХЕМЫ БД (структура таблиц). НЕ путать с ALGO_VERSION (версия формул).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +127,47 @@ _MIGRATIONS: list[tuple[int, str]] = [
             key    TEXT PRIMARY KEY,
             value  TEXT
         );
+        """,
+    ),
+    (
+        2,
+        """
+        -- ─────────────────────────────────────────────────────────────────────
+        -- Миграция v2 (этап 5). Две независимые правки, обе безопасны для сырья:
+        --   (1) period_aggregates: первая редакция (v1) была СТАРОЙ схемой с
+        --       зашитыми якорями (pace_at_fixed_hr, gct_at_fixed_pace) и именами
+        --       (intensity_distribution) — ТЗ §13 запрещает их коннектору.
+        --       Таблица ПУСТА (этап 5 не делался, CRUD записи не было) → DROP+CREATE
+        --       без переноса данных безопасен. Новая схема — §3.5 ТЗ:
+        --       якорь-нейтральные сетки by_source + provenance, без имён/зон.
+        --   (2) activity_enriched: ALTER ADD 2 колонки под бакетные выжимки
+        --       enrich-0.3.0. ALTER ADD COLUMN в SQLite — метаданные-операция, НЕ
+        --       переписывает таблицу, НЕ трогает activity_raw. Старые 0.2.2 строки
+        --       получают NULL в новых полях и остаются ВАЛИДНЫМИ для чтения; новые
+        --       0.3.0 строки пишутся рядом под своим ключом (recompute, resumable).
+        -- Ни один оператор не касается activity_raw/activities/interest_index/meta.
+        -- ─────────────────────────────────────────────────────────────────────
+
+        DROP TABLE IF EXISTS period_aggregates;
+        CREATE TABLE period_aggregates (
+            period_key          TEXT NOT NULL,   -- напр. 2026-Q2 (квартальные срезы, МЕТОД §5.4)
+            algo_version        TEXT NOT NULL,
+            -- якорь-нейтральные, без имён (§3.5):
+            volume_7d           TEXT,    -- скользящее окно, км (якоря нет)
+            volume_28d          TEXT,
+            max_hr_accumulated  INTEGER, -- ~97-й перцентиль распределения per-activity max, НЕ max() (§2.4)
+            decoupling          TEXT,    -- механический ratio (2-я пол./1-я), без имени «база держит» (LLM)
+            hr_recovery         TEXT,    -- падение HR после кругов быстрее медианы темпа, без имени (LLM)
+            pace_by_hr_grid     TEXT,    -- темп по сетке HR, by_source {chest:{...},optical:{...}} (§3.5.1)
+            gct_by_pace_grid    TEXT,    -- GCT/vert-ratio по сетке темпа, одной строкой (биомеханика железо-незав.)
+            provenance          TEXT,    -- ФАКТ происхождения: hr_sources/device_models с долями и n; без суждения
+            computed_at         TEXT,
+            PRIMARY KEY (period_key, algo_version)
+        );
+
+        -- бакетные выжимки enrich-0.3.0 (per-row версия в PK уже различает 0.2.2/0.3.0)
+        ALTER TABLE activity_enriched ADD COLUMN biomech_by_pace_bucket TEXT;
+        ALTER TABLE activity_enriched ADD COLUMN pace_by_hr_bucket TEXT;
         """,
     ),
 ]
@@ -251,6 +292,7 @@ class Store:
         "activity_id", "algo_version", "hr_histogram", "pace_histogram", "clusters",
         "pace_variance", "hr_variance", "biomech_by_pace", "lactate_marks",
         "elevation", "confidence", "computed_at",
+        "biomech_by_pace_bucket", "pace_by_hr_bucket",
     )
 
     def has_enriched(self, activity_id: int, algo_version: str) -> bool:
@@ -280,6 +322,8 @@ class Store:
             "elevation": json.dumps(enriched.get("elevation"), ensure_ascii=False),
             "confidence": json.dumps(enriched.get("confidence"), ensure_ascii=False),
             "computed_at": _iso_now(),
+            "biomech_by_pace_bucket": json.dumps(enriched.get("biomech_by_pace_bucket"), ensure_ascii=False),
+            "pace_by_hr_bucket": json.dumps(enriched.get("pace_by_hr_bucket"), ensure_ascii=False),
         }
         cols = self._ENR_COLS
         ph = ",".join("?" for _ in cols)
@@ -316,7 +360,8 @@ class Store:
             return None
         out = dict(row)
         for k in ("hr_histogram", "pace_histogram", "clusters", "biomech_by_pace",
-                  "lactate_marks", "elevation", "confidence"):
+                  "lactate_marks", "elevation", "confidence",
+                  "biomech_by_pace_bucket", "pace_by_hr_bucket"):
             if out.get(k):
                 out[k] = json.loads(out[k])
         return out

@@ -28,7 +28,12 @@ import numpy as np
 # 0.2.2: свёртка гистограммы в форму переписана — полка собирается ростом от пика
 #        (граница=впадина), доля=вся масса полки; mono/diffuse различаются по
 #        КОНЦЕНТРАЦИИ массы в ядре (горб vs плато), не по абсолютной ширине.
-ALGO_VERSION = "enrich-0.2.2"
+# 0.3.0: добавлены две бакетные выжимки для сеток периода (этап 5) — НОВЫЕ поля,
+#        старая калибровка (фильтр пульса, перцентили, свёртка формы, moving-time,
+#        кластеры) НЕ ТРОНУТА. biomech_by_pace_bucket (ось=темп) и pace_by_hr_bucket
+#        (ось=пульс): {median,p25,p75,seconds} на бакет, без метки источника.
+#        Из них aggregate строит gct_by_pace_grid и pace_by_hr_grid (by_source).
+ALGO_VERSION = "enrich-0.3.0"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -88,6 +93,23 @@ CLUSTER_MIN_DURATION_S = 30
 CLUSTER_PACE_TOL_S = 8       # допуск стабильности темпа внутри кластера (сек/км)
 CLUSTER_HR_TOL_BPM = 4       # допуск стабильности пульса (уд/мин)
 CLUSTER_MAX = 3             # сколько кластеров отдаём (1–3, МЕТОД §3.1)
+
+# --- Бакетные выжимки для сеток периода (enrich-0.3.0; ТЗ §3.5, §3.5.1) --------
+# Две НЕЗАВИСИМЫЕ бакетизации одних streams по РАЗНЫМ осям (две физиологические
+# связки, нельзя слить в одну ось):
+#   biomech_by_pace_bucket — ось=ТЕМП: «GCT/vert-ratio/шаг на данном темпе»
+#       (экономичность; gct_by_pace_grid периода агрегируется отсюда);
+#   pace_by_hr_bucket      — ось=ПУЛЬС: «темп на данном пульсе»
+#       (аэробная эффективность; pace_by_hr_grid by_source агрегируется отсюда).
+# Значение бакета несёт ПЕРЦЕНТИЛИ (median/p25/p75 — ФОРМА, не момент: дисперсия
+# смазала бы асимметричный GCT-дрейф под усталостью; перцентили робастны, §2.4) и
+# СЕКУНДЫ в бакете (взвешенная агрегация по периоду: 5 мин и 40 мин на одном темпе
+# вносят разный вес). Метки hr_source НЕТ — тренировка вся от одного источника;
+# разбивку by_source делает aggregate по каталогу (демаркация §1.1).
+# Малое seconds в бакете НЕ фильтруется здесь (§3.5.2: определимость, не значимость) —
+# отдаём {значение, seconds} как есть, «достаточно ли времени» решает aggregate/LLM.
+PACE_BIOMECH_BUCKET_S_PER_KM = 15  # ширина темп-бакета биомеханики (старт; бьётся с pace-гистограммой)
+HR_PACE_BUCKET_BPM = 5             # ширина HR-бакета для pace_by_hr (как hr-гистограмма)
 
 # Ключи потока
 K_TS = "directTimestamp"
@@ -292,6 +314,67 @@ def _biomech_by_pace(pace: np.ndarray, cad: np.ndarray, gct: np.ndarray,
     }
 
 
+def _percentile_cell(values: np.ndarray, weights: np.ndarray) -> Optional[dict]:
+    """{median, p25, p75} по значениям, взвешенным временем + seconds в ячейке.
+
+    Перцентили, НЕ среднее/дисперсия (§3.5.1: форма, не момент — асимметричный
+    дрейф под усталостью виден только по перцентилям; дисперсия его смазывает,
+    один выброс её раздувает). Взвешивание по времени: точка, провисевшая дольше,
+    весит больше — иначе прорежённый поток даст ложный перекос. seconds = сумма
+    времени в ячейке (нужна aggregate для взвешивания бакета по периоду).
+    Малое seconds НЕ режется (§3.5.2 определимость, не значимость) — отдаём как есть.
+    """
+    good = ~np.isnan(values) & ~np.isnan(weights)
+    v, w = values[good], weights[good]
+    if v.size == 0 or w.sum() <= 0:
+        return None
+    # взвешенные по времени перцентили: сортируем, идём по накопленному весу
+    order = np.argsort(v)
+    vs, ws = v[order], w[order]
+    cum = np.cumsum(ws) - 0.5 * ws          # центры весовых интервалов
+    cum /= ws.sum()
+    def wp(q: float) -> float:
+        return round(float(np.interp(q, cum, vs)), 1)
+    return {"median": wp(0.5), "p25": wp(0.25), "p75": wp(0.75),
+            "seconds": round(float(w.sum()), 1)}
+
+
+def _bucketize(axis: np.ndarray, dt: np.ndarray, bucket: float,
+               metrics: dict[str, np.ndarray]) -> dict:
+    """Раскладывает точки по бакетам ОСИ (темп или HR) и в каждом считает
+    {median,p25,p75,seconds} по каждой метрике. Общий движок обеих выжимок —
+    меняются только ось и набор метрик (демаркация осей §3.5.1, формат един).
+
+    Возвращает {bucket_int: {metric_name: {median,p25,p75,seconds} | None}}.
+    Бакет существует, только если в нём есть валидная ось-точка (определимость) —
+    пустых бакетов не плодим, но и не сглаживаем разреженность (§3.5.2).
+    """
+    out: dict[int, dict] = {}
+    good_axis = ~np.isnan(axis)
+    if good_axis.sum() == 0:
+        return out
+    lo = np.floor(np.nanmin(axis) / bucket) * bucket
+    hi = np.ceil(np.nanmax(axis) / bucket) * bucket + bucket
+    edges = np.arange(lo, hi, bucket)
+    bucket_idx = np.full(axis.shape, -1, dtype=int)
+    bucket_idx[good_axis] = np.clip(
+        ((axis[good_axis] - lo) // bucket).astype(int), 0, len(edges) - 1)
+    for k in range(len(edges)):
+        sel = bucket_idx == k
+        if not sel.any():
+            continue
+        cell = {}
+        any_metric = False
+        for name, arr in metrics.items():
+            c = _percentile_cell(arr[sel], dt[sel])
+            cell[name] = c
+            if c is not None:
+                any_metric = True
+        if any_metric:
+            out[int(edges[k])] = cell
+    return out
+
+
 def _lactate_from_watch(lact_points: list[dict], ts: np.ndarray,
                         hr: np.ndarray, pace: np.ndarray) -> list[dict]:
     """Метки с часов → калибровочные точки: подтягиваем hr/pace той секунды.
@@ -446,6 +529,8 @@ def enrich_activity(
             "hr_variance": None,
             "median_crossings": 0,
             "biomech_by_pace": {},
+            "biomech_by_pace_bucket": {},
+            "pace_by_hr_bucket": {},
             "lactate_marks": None,
             "elevation": {"gain_m": None, "loss_m": None},
             "max_hr": None,
@@ -513,6 +598,13 @@ def enrich_activity(
                         if hr_mv[~np.isnan(hr_mv)].size else None),
         "median_crossings": _median_crossings(pace_mv),
         "biomech_by_pace": _biomech_by_pace(pace, cad, gct, vr, stride, mask),
+        "biomech_by_pace_bucket": _bucketize(
+            pace[mv], dt[mv], PACE_BIOMECH_BUCKET_S_PER_KM,
+            {"gct": gct[mv], "vert_ratio": vr[mv], "stride": stride[mv]},
+        ) if mv.any() else {},
+        "pace_by_hr_bucket": _bucketize(
+            hr_clean[mv], dt[mv], HR_PACE_BUCKET_BPM, {"pace": pace[mv]},
+        ) if mv.any() else {},
         "lactate_marks": lactate_marks,
         "elevation": {"gain_m": elev_gain, "loss_m": elev_loss},
         "max_hr": (int(round(float(np.nanpercentile(hr_clean, MAX_HR_PERCENTILE))))
@@ -574,4 +666,34 @@ if __name__ == "__main__":
     # 99-й перцентиль его игнорирует; залипание 205×4 срезано. max_hr ≈ полка 185-189.
     assert 184 <= res["max_hr"] <= 191, \
         f"перцентиль держит полку 185, игнорит одиночный 210, max_hr={res['max_hr']}"
+
+    # --- enrich-0.3.0: бакетные выжимки ---
+    # pace_by_hr_bucket: ось=HR, в потоке есть pace и hr → должен заполниться.
+    pbh = res["pace_by_hr_bucket"]
+    assert pbh, "pace_by_hr_bucket должен считаться (есть pace+hr)"
+    # секунды HR-бакетов сходятся с hr-ГИСТОГРАММОЙ (та же чистка пульса: hr_clean),
+    # а НЕ с moving-time — пульс отфильтрован stuck/вне-диапазона, темп нет.
+    # Это согласованность с тем, как считаются гистограмма и кластеры.
+    tot = sum(c["pace"]["seconds"] for c in pbh.values() if c.get("pace"))
+    hist_tot = sum(res["hr_histogram"].values())
+    assert abs(tot - hist_tot) < 5, \
+        f"секунды HR-бакетов ({tot}) должны сходиться с hr-гистограммой ({hist_tot})"
+    # формат ячейки: median/p25/p75/seconds, p25<=median<=p75
+    cell = next(c["pace"] for c in pbh.values() if c.get("pace") and c["pace"]["seconds"] > 10)
+    assert cell["p25"] <= cell["median"] <= cell["p75"], f"перцентили не упорядочены: {cell}"
+    # быстрый бег (~185 уд) должен лечь в темп заметно быстрее трусцы — связка HR↔темп жива
+    fast_buckets = [int(k) for k in pbh if int(k) >= 180]
+    slow_buckets = [int(k) for k in pbh if int(k) <= 140]
+    if fast_buckets and slow_buckets:
+        fast_pace = min(pbh[str(k)]["pace"]["median"] for k in fast_buckets)
+        slow_pace = max(pbh[str(k)]["pace"]["median"] for k in slow_buckets)
+        assert fast_pace < slow_pace, "на высоком HR темп должен быть быстрее (меньше сек/км)"
+    # biomech_by_pace_bucket: в этом потоке биомеханики нет → бакеты есть (ось=темп
+    # определима), но метрики внутри None. Это штатно, не ошибка.
+    bbp = res["biomech_by_pace_bucket"]
+    assert isinstance(bbp, dict), "biomech_by_pace_bucket должен быть dict даже без датчика"
+    if bbp:
+        any_cell = next(iter(bbp.values()))
+        assert "gct" in any_cell, "формат бакета биомеханики: gct/vert_ratio/stride"
+        assert any_cell["gct"] is None, "без датчика gct в бакете = None (нет данных)"
     print("\nself-test OK")
