@@ -354,10 +354,14 @@ class Store:
         mt = enriched.get("moving_time_s")
         mc = enriched.get("median_crossings")
         mx = enriched.get("max_hr")
+        hrs = enriched.get("hr_source")   # §3.5.1: chest (balance в потоке) / unknown
+        # hr_source пишем ПРЯМО (не COALESCE): при recompute со сменой логики извлечения
+        # он должен ОБНОВИТЬСЯ, а COALESCE сохранил бы старое значение. max_hr —
+        # COALESCE, т.к. может быть из сводки до обогащения; hr_source только из enrich.
         self.conn.execute(
             "UPDATE activities SET moving_time_s=COALESCE(?,moving_time_s), "
-            "max_hr=COALESCE(?,max_hr) WHERE activity_id=?",
-            (mt, mx, activity_id),
+            "max_hr=COALESCE(?,max_hr), hr_source=? WHERE activity_id=?",
+            (mt, mx, hrs, activity_id),
         )
         # median_crossings храним в interest_index (дешёвый сигнал для отбора/фильтра)
         self.conn.execute(
@@ -470,6 +474,26 @@ class Store:
         )
         self.conn.commit()
 
+    def backfill_device_model(self, activity_id: int) -> None:
+        """Заполняет device_model из сохранённого summary_json (deviceId), без сети.
+        Факт железа для группировки (§5.4). Идемпотентно. NULL если deviceId нет.
+        Существующий каталог мог быть создан со старым None — дозаполняем при обогащении."""
+        row = self.conn.execute(
+            "SELECT summary_json, device_model FROM activities WHERE activity_id=?",
+            (activity_id,),
+        ).fetchone()
+        if not row or not row["summary_json"]:
+            return
+        try:
+            dev = json.loads(row["summary_json"]).get("deviceId")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return
+        if dev is not None and row["device_model"] != str(dev):
+            self.conn.execute(
+                "UPDATE activities SET device_model=? WHERE activity_id=?",
+                (str(dev), activity_id),
+            )
+
     def get_raw(self, activity_id: int, kind: str) -> Optional[Any]:
         row = self.conn.execute(
             "SELECT payload FROM activity_raw WHERE activity_id=? AND kind=?",
@@ -547,8 +571,14 @@ def activity_row_from_summary(summary: dict) -> dict:
         # флаги достоверности §3.2 (gps_validated уточняется позже — пока NULL)
         "has_biomech_sensor": has_biomech,
         "gps_validated": None,
-        "device_model": None,
-        "hr_source": None,
+        # deviceId — идентификатор ЧАСОВ (числовой), факт группировки «какое железо».
+        # НЕ граница источника пульса: одни и те же часы работают и с нагрудником, и без
+        # (проверено на архиве — оба deviceId имеют и chest, и non-chest тренировки).
+        # §5.4: граница по hr_source, НЕ по device_model (смена часов при том же
+        # нагруднике пульс не ломает). Кладём как факт, hr_source считается отдельно (enrich).
+        "device_model": (str(summary.get("deviceId"))
+                         if summary.get("deviceId") is not None else None),
+        "hr_source": None,   # заполняется обогащением из потока (enrich-0.6.0), не здесь
         "gps_type": None,
         "biomech_source": None,
         "summary_json": json.dumps(summary, ensure_ascii=False),

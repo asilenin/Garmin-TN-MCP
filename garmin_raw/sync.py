@@ -278,6 +278,11 @@ def enrich_batch(slug: str, *, limit: int = 200, start: Optional[str] = None,
                     lactate_watch_points=lact, lactate_comment_values=comment,
                 )
                 st.put_enriched(aid, enriched)
+                # device_model из сохранённого summary_json (deviceId — факт железа).
+                # Заполняется здесь, т.к. существующий каталог мог быть создан со
+                # старым None; читаем из УЖЕ сохранённого summary, без сети (§5.4:
+                # факт группировки, НЕ граница источника — та по hr_source).
+                st.backfill_device_model(aid)
                 rep.enriched_ok += 1
             except Exception as exc:  # noqa: BLE001
                 # аномалия: обогащение НЕ пишем (сырьё, если скачалось, уже в БД).

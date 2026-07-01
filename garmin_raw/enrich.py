@@ -48,7 +48,13 @@ import numpy as np
 #        прогрессив — direction, который variance не выдаёт; иначе decoupling врёт
 #        правдоподобно на разгоне, путая его с дрейфом базы). hr_recovery: различены
 #        no_laps / single_lap / no_fast_laps (три факта, не схлопывать).
-ALGO_VERSION = "enrich-0.5.1"
+# 0.6.0: hr_source из потока (наличие GCT-balance → chest, иначе unknown; §3.5.1).
+#        balance физически только с нагрудника → chest НАДЁЖЕН; отсутствие = unknown
+#        (НЕ optical — нечем подтвердить, прямого поля сенсора Garmin нет). chest —
+#        чистая но неполная подгруппа (сравнение пульса внутри неё надёжно); unknown —
+#        смесь. Переход chest→unknown ≠ смена железа (суждение LLM, не коннектора).
+#        Поднимается в каталог через put_enriched (как max_hr) → by_source оживает.
+ALGO_VERSION = "enrich-0.6.0"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -156,6 +162,10 @@ K_GCT = "directGroundContactTime"
 K_VR = "directVerticalRatio"
 K_STRIDE = "directStrideLength"
 K_ELEV = "directElevation"
+# GCT-balance (L/R баланс фазы контакта) пишется Garmin ТОЛЬКО с нагрудного датчика
+# с акселерометром (HRM-Pro/Run) — оптика запястья его физически не даёт. Прямой,
+# детерминированный признак нагрудника → hr_source=chest (enrich-0.6.0, §3.5.1).
+K_GCT_BALANCE = "directGroundContactBalanceLeft"
 
 
 def _index_map(stream: dict) -> dict[str, int]:
@@ -166,6 +176,36 @@ def _index_map(stream: dict) -> dict[str, int]:
         if k is not None:
             out[k] = m["metricsIndex"]
     return out
+
+
+def _hr_source_from_stream(idx: dict, has_hr: bool) -> str:
+    """Определяет hr_source по наличию GCT-balance в потоке (enrich-0.6.0, §3.5.1).
+
+    ФИЗИКА признака: GCT-balance (L/R) Garmin пишет ТОЛЬКО с нагрудного датчика с
+    акселерометром (HRM-Pro/Run). Оптика запястья его не даёт. Поэтому:
+      balance в потоке есть → chest (НАДЁЖНО: физически только нагрудник)
+      balance нет           → unknown (НЕ optical! — нечем подтвердить: может быть
+                              оптика ИЛИ простой нагрудник без акселерометра ИЛИ
+                              нагрудник-пульс со Stryd-biomech. Прямого поля сенсора
+                              Garmin не отдаёт — проверено на архиве.)
+      нет пульса вообще     → unknown
+
+    СЕМАНТИКА ГРУПП (критично для LLM, чтобы не строить ложную границу в §5.4):
+    - chest — ЧИСТАЯ, но НЕПОЛНАЯ подгруппа: где balance есть, там точно нагрудник →
+      сравнение пульса ВНУТРИ chest надёжно. НО не все нагрудные сюда попадают (Stryd
+      мог перебить biomech-источник → chest-пульс уехал в unknown).
+    - unknown — СМЕСЬ (оптика / нагрудник-без-balance / chest-со-Stryd). «Не знаю»,
+      НЕ «оптика» и НЕ однородная группа.
+    - Переход chest→unknown во времени ≠ смена железа (unknown мог быть тем же
+      нагрудником без balance). §5.4-«граница смены железа» надёжна ТОЛЬКО внутри
+      chest-группы; chest↔unknown — не граница, а «дальше не знаю» (суждение LLM,
+      коннектор кладёт факт).
+    """
+    if not has_hr:
+        return "unknown"
+    if K_GCT_BALANCE in idx:
+        return "chest"
+    return "unknown"
 
 
 def _column(rows: list[dict], idx: Optional[int]) -> np.ndarray:
@@ -752,6 +792,7 @@ def enrich_activity(
             "lactate_marks": None,
             "elevation": {"gain_m": None, "loss_m": None},
             "max_hr": None,
+            "hr_source": "unknown",   # нет потока → источник неопределим
             "no_stream": True,   # пометка: детальный поток отсутствовал
         }
 
@@ -833,6 +874,8 @@ def enrich_activity(
         "elevation": {"gain_m": elev_gain, "loss_m": elev_loss},
         "max_hr": (int(round(float(np.nanpercentile(hr_clean, MAX_HR_PERCENTILE))))
                    if hr_clean[~np.isnan(hr_clean)].size else None),
+        "hr_source": _hr_source_from_stream(
+            idx, has_hr=bool(hr_clean[~np.isnan(hr_clean)].size)),
     }
 
 
