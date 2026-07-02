@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Версия СХЕМЫ БД (структура таблиц). НЕ путать с ALGO_VERSION (версия формул).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +182,70 @@ _MIGRATIONS: list[tuple[int, str]] = [
         -- после рабочих кругов. Оба БЕЗ имён/якорей (§3.5) — суждение LLM.
         ALTER TABLE activity_enriched ADD COLUMN decoupling TEXT;
         ALTER TABLE activity_enriched ADD COLUMN hr_recovery TEXT;
+        """,
+    ),
+    (
+        4,
+        """
+        -- ─────────────────────────────────────────────────────────────────────
+        -- Миграция v4 (этап 7). Рукотворные данные через MCP: лактатные замеры и
+        -- заметки, внесённые LLM/человеком в разговоре. Источник был в разговоре →
+        -- НЕ воспроизводимо из сырья → физически изолировано от recompute (ТЗ §3.6).
+        --
+        -- Две таблицы, разведённые по инварианту «намерение vs раствор»:
+        --   user_data              — НАМЕРЕНИЕ (mmol, at_time, user_ref). Вечно,
+        --                            read-only для recompute (как activity_raw).
+        --                            mark_id рождается ЗДЕСЬ при записи, навечно.
+        --   user_lactate_resolved  — РАСТВОР (lap, hr_at, pace_at). Версионируемо,
+        --                            recompute пересчитывает из user_data+streams
+        --                            (DELETE версии + INSERT). mark_id — FK, НЕ
+        --                            порождается здесь: иначе идентичность метки
+        --                            завязалась бы на момент резолва и recompute
+        --                            «вспомнил бы про user_data» через PK — протечка
+        --                            изоляции. Идентичность живёт в намерении.
+        --
+        -- Обе — НОВЫЕ таблицы (CREATE), НЕ трогают activity_raw/activities/
+        -- activity_enriched/period_aggregates. Существующие данные не затрагиваются.
+        --
+        -- kind разложен в типизированные колонки (mmol/user_ref/at_time/note_text),
+        -- а не в opaque payload: at_time/user_ref нужны резолверу как первоклассные,
+        -- mmol — читаемое/фильтруемое число (философия проекта: явные поля > JSON,
+        -- где поле несёт смысл).
+        --
+        -- mark_id — INTEGER PRIMARY KEY AUTOINCREMENT: монотонный, НЕ переиспользуется
+        -- после удаления (важно для вечной идентичности — удалённый id не должен
+        -- позже достаться другой метке).
+        --
+        -- at_time — wall-clock UTC (мс epoch), НЕ elapsed-moving: замер лактата часто
+        -- в ПАУЗЕ после рабочего куска (человек остановился, уколол палец). elapsed-
+        -- moving выкинул бы точку паузы (та же логика, что hr_recovery Q8: края по
+        -- wall-clock, moving-маска убрала бы измеряемую точку). Согласовано с потоком
+        -- (directTimestamp — wall-clock мс) и lap bounds (startTimeGMT UTC).
+        -- ─────────────────────────────────────────────────────────────────────
+
+        CREATE TABLE IF NOT EXISTS user_data (
+            mark_id     INTEGER PRIMARY KEY AUTOINCREMENT,  -- вечная идентичность метки
+            activity_id INTEGER NOT NULL,
+            kind        TEXT NOT NULL,      -- 'lactate' | 'note'
+            mmol        REAL,               -- kind=lactate; NULL для note
+            user_ref    TEXT,               -- напр. 'lap4'; NULL если задан at_time
+            at_time     INTEGER,            -- wall-clock UTC мс; NULL если только user_ref
+            note_text   TEXT,               -- kind=note; NULL для lactate
+            source      TEXT NOT NULL,      -- 'llm' | 'manual'
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_data_activity ON user_data(activity_id);
+
+        CREATE TABLE IF NOT EXISTS user_lactate_resolved (
+            mark_id      INTEGER NOT NULL,  -- FK → user_data.mark_id (НЕ порождается здесь)
+            algo_version TEXT NOT NULL,
+            lap          INTEGER,           -- круг, в который попала секунда замера
+            hr_at        REAL,              -- пульс ближайшей секунды потока (калибр. точка)
+            pace_at      REAL,              -- темп той же секунды
+            computed_at  TEXT,
+            PRIMARY KEY (mark_id, algo_version),
+            FOREIGN KEY (mark_id) REFERENCES user_data(mark_id) ON DELETE CASCADE
+        );
         """,
     ),
 ]
@@ -502,6 +566,127 @@ class Store:
         return _decompress(row["payload"]) if row else None
 
     # ------------------------------------------------------------------ #
+    # user_data — рукотворные метки (этап 7, §3.6). Намерение изолировано от
+    # recompute; привязка (раствор) версионируема в user_lactate_resolved.
+    # ------------------------------------------------------------------ #
+    def add_user_lactate(self, activity_id: int, mmol: float,
+                         at_time: Optional[int] = None,
+                         user_ref: Optional[str] = None,
+                         source: str = "llm") -> int:
+        """Записать НАМЕРЕНИЕ лактатной метки. Возвращает вечный mark_id.
+
+        Привязка (lap/hr_at/pace_at) здесь НЕ вычисляется — это раствор, живёт в
+        user_lactate_resolved, версионируется, резолвится из streams (enrich).
+        Хотя бы одно из at_time/user_ref должно быть задано (иначе метку некуда
+        привязать); проверку осмысленности входа делает вызывающий тул.
+        at_time — wall-clock UTC мс (НЕ elapsed), см. миграцию v4.
+        """
+        cur = self.conn.execute(
+            "INSERT INTO user_data(activity_id,kind,mmol,user_ref,at_time,source,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (activity_id, "lactate", float(mmol), user_ref, at_time, source, _iso_now()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def add_note(self, activity_id: int, text: str, source: str = "llm") -> int:
+        """Записать заметку (свободный текст, контекст для LLM). Возвращает mark_id.
+        Не фильтруется, не резолвится — раствора у заметки нет."""
+        cur = self.conn.execute(
+            "INSERT INTO user_data(activity_id,kind,note_text,source,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (activity_id, "note", text, source, _iso_now()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_user_mark(self, mark_id: int) -> bool:
+        """Жёсткое удаление метки по mark_id. Каскадом чистит user_lactate_resolved
+        (FK ON DELETE CASCADE, foreign_keys=ON). История правок не ведётся: метка
+        либо есть, либо нет. Возвращает True если строка была удалена."""
+        cur = self.conn.execute("DELETE FROM user_data WHERE mark_id=?", (mark_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_user_data(self, activity_id: int) -> list[dict]:
+        """Сырые НАМЕРЕНИЯ по активности (без раствора). Для резолвера (enrich):
+        он берёт лактатные метки, резолвит привязку, пишет put_user_lactate_resolved.
+        """
+        rows = self.conn.execute(
+            "SELECT mark_id,activity_id,kind,mmol,user_ref,at_time,note_text,"
+            "source,created_at FROM user_data WHERE activity_id=? ORDER BY mark_id",
+            (activity_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def put_user_lactate_resolved(self, mark_id: int, algo_version: str,
+                                  lap: Optional[int], hr_at: Optional[float],
+                                  pace_at: Optional[float]) -> None:
+        """Записать РАСТВОР (привязку) метки под версией. Идемпотентно по
+        (mark_id, algo_version). mark_id — уже существующий ключ из user_data;
+        эта таблица его НЕ порождает (идентичность в намерении, не в растворе)."""
+        self.conn.execute(
+            "INSERT INTO user_lactate_resolved(mark_id,algo_version,lap,hr_at,pace_at,computed_at) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(mark_id,algo_version) DO UPDATE SET "
+            "lap=excluded.lap, hr_at=excluded.hr_at, pace_at=excluded.pace_at, "
+            "computed_at=excluded.computed_at",
+            (mark_id, algo_version, lap, hr_at, pace_at, _iso_now()),
+        )
+        self.conn.commit()
+
+    def clear_user_lactate_resolved(self, algo_version: str) -> int:
+        """Снести весь раствор данной версии (перед пересчётом резолвера).
+        recompute: DELETE версии → INSERT заново из user_data+streams. Намерение
+        (user_data) не участвует — read-only источник, как streams. Возвращает
+        число удалённых строк."""
+        cur = self.conn.execute(
+            "DELETE FROM user_lactate_resolved WHERE algo_version=?", (algo_version,)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def get_user_marks_resolved(self, activity_id: int,
+                                algo_version: str) -> list[dict]:
+        """НАМЕРЕНИЕ ⨝ РАСТВОР по (mark_id, текущая algo_version) — для compact/full.
+        Streams НЕ читает (раствор уже в таблице). Если раствора текущей версии нет
+        (метку добавили, resolve ещё не прошёл) — лактат отдаётся с resolved='pending'
+        (легальное «привязка не вычислена», не ошибка, не дырка; §3.5.1 паттерн
+        определимости). Заметки идут как есть (раствора у них нет).
+        """
+        rows = self.conn.execute(
+            "SELECT u.mark_id, u.kind, u.mmol, u.user_ref, u.at_time, u.note_text, "
+            "u.source, u.created_at, r.lap, r.hr_at, r.pace_at "
+            "FROM user_data u "
+            "LEFT JOIN user_lactate_resolved r "
+            "  ON r.mark_id = u.mark_id AND r.algo_version = ? "
+            "WHERE u.activity_id = ? ORDER BY u.mark_id",
+            (algo_version, activity_id),
+        ).fetchall()
+        out = []
+        for r in rows:
+            if r["kind"] == "note":
+                out.append({"mark_id": r["mark_id"], "kind": "note",
+                            "text": r["note_text"], "source": r["source"],
+                            "created_at": r["created_at"]})
+                continue
+            # kind == lactate
+            has_resolved = r["lap"] is not None or r["hr_at"] is not None \
+                or r["pace_at"] is not None
+            mark = {"mark_id": r["mark_id"], "kind": "lactate", "mmol": r["mmol"],
+                    "at_time": r["at_time"], "user_ref": r["user_ref"],
+                    "source": r["source"], "created_at": r["created_at"]}
+            if has_resolved:
+                mark["resolved"] = "resolved"
+                mark["lap"] = r["lap"]
+                mark["hr_at"] = r["hr_at"]
+                mark["pace_at"] = r["pace_at"]
+            else:
+                mark["resolved"] = "pending"  # метка есть, раствор версии не вычислен
+            out.append(mark)
+        return out
+
+    # ------------------------------------------------------------------ #
     # Статус (для cache_status / CLI)
     # ------------------------------------------------------------------ #
     def status(self) -> dict:
@@ -610,6 +795,54 @@ if __name__ == "__main__":
         assert st.get_raw(123, "laps") == {"lapDTOs": [{"x": 1}]}
         st.meta_set("algo_version", "0.0.0")
         st.meta_set("download_policy", "all")
+
+        # --- этап 7: user_data (намерение) + user_lactate_resolved (раствор) ---
+        assert st.schema_version == 4, st.schema_version
+        ver = "test-0.0.0"
+        # намерение: две лактатные метки + заметка
+        m1 = st.add_user_lactate(123, 6.0, at_time=1_700_000_150_000, source="llm")
+        m2 = st.add_user_lactate(123, 3.3, user_ref="lap4", source="manual")
+        n1 = st.add_note(123, "интервалка 4x1км, лактат после 4-го", source="llm")
+        assert m2 > m1 and n1 > m2, (m1, m2, n1)      # AUTOINCREMENT монотонен
+        rows = st.get_user_data(123)
+        assert len(rows) == 3, rows
+        assert [r["kind"] for r in rows] == ["lactate", "lactate", "note"], rows
+        assert rows[0]["mmol"] == 6.0 and rows[0]["at_time"] == 1_700_000_150_000
+        assert rows[1]["user_ref"] == "lap4" and rows[1]["at_time"] is None
+
+        # до резолва: лактат pending, заметка как есть
+        marks = st.get_user_marks_resolved(123, ver)
+        by_id = {mk["mark_id"]: mk for mk in marks}
+        assert by_id[m1]["resolved"] == "pending", by_id[m1]
+        assert by_id[m2]["resolved"] == "pending", by_id[m2]
+        assert by_id[n1]["kind"] == "note" and "resolved" not in by_id[n1]
+        assert by_id[n1]["text"].startswith("интервалка")
+
+        # раствор одной метки под версией → она resolved, вторая всё ещё pending
+        st.put_user_lactate_resolved(m1, ver, lap=4, hr_at=185.0, pace_at=205.0)
+        marks = st.get_user_marks_resolved(123, ver)
+        by_id = {mk["mark_id"]: mk for mk in marks}
+        assert by_id[m1]["resolved"] == "resolved", by_id[m1]
+        assert by_id[m1]["hr_at"] == 185.0 and by_id[m1]["lap"] == 4
+        assert by_id[m2]["resolved"] == "pending", by_id[m2]
+        # раствор виден ТОЛЬКО под своей версией (изоляция по algo_version)
+        assert st.get_user_marks_resolved(123, "other-ver")[0]["resolved"] == "pending"
+
+        # clear версии (перед пересчётом резолвера) → снова pending
+        assert st.clear_user_lactate_resolved(ver) == 1
+        assert st.get_user_marks_resolved(123, ver)[0]["resolved"] == "pending"
+
+        # жёсткое удаление + каскад в раствор
+        st.put_user_lactate_resolved(m2, ver, lap=4, hr_at=170.0, pace_at=None)
+        assert st.delete_user_mark(m2) is True
+        assert len(st.get_user_data(123)) == 2                 # намерение удалено
+        assert st.conn.execute(                                # раствор снесён каскадом
+            "SELECT COUNT(*) FROM user_lactate_resolved WHERE mark_id=?", (m2,)
+        ).fetchone()[0] == 0
+        # mark_id НЕ переиспользуется после удаления
+        m3 = st.add_user_lactate(123, 4.0, at_time=1_700_000_200_000)
+        assert m3 > n1, (m3, n1)
+
         import pprint
         pprint.pp(st.status())
         st.close()
