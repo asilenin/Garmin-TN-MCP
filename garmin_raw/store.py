@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Версия СХЕМЫ БД (структура таблиц). НЕ путать с ALGO_VERSION (версия формул).
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +246,60 @@ _MIGRATIONS: list[tuple[int, str]] = [
             PRIMARY KEY (mark_id, algo_version),
             FOREIGN KEY (mark_id) REFERENCES user_data(mark_id) ON DELETE CASCADE
         );
+        """,
+    ),
+    (
+        5,
+        """
+        -- ─────────────────────────────────────────────────────────────────────
+        -- Миграция v5 (этап 7). Расщепление pending на два состояния по ПРОИСХОЖДЕНИЮ
+        -- + доказательство вердикта. Аддитивно поверх v4 (только ADD COLUMN с DEFAULT —
+        -- существующие строки получают validation='ok', ничего не переписывается).
+        --
+        -- ЗАЧЕМ. pending был вычисляемым на чтении (нет resolved-строки под версией) —
+        -- один цвет, причину не различить. Но «метку добавили, ждём streams» и «метку
+        -- добавили user_ref='lapN', а laps ещё нет → круг N недоказуем» — РАЗНЫЕ pending:
+        --   pending_resolve    — вход провалидирован (at_time; или user_ref+laps есть+
+        --                        круг N есть), ждём streams. recompute → резолвить.
+        --   pending_validation — вход НЕ провалидирован (user_ref='lapN', laps нет →
+        --                        N недоказуем). recompute после дозакачки laps → сначала
+        --                        провалидировать N, и если круга нет — ошибка (invalid).
+        -- Без различения опечатка 'lap40' на тренировке без laps тонет: входная
+        -- валидация её не поймала (laps не было), одноцветный pending не заставит
+        -- recompute проверить N при появлении laps → метка тихо None или вечный pending.
+        -- Симметрия с hr_recovery: no_laps (нет в кэше, чинится) vs no_fast_laps
+        -- (честная неопределимость) — тот же водораздел «доказуема ли невозможность
+        -- на имеющейся структуре», применённый к валидации входа.
+        --
+        -- validation — ПРОИЗВОДНОЕ от laps (не от резолвера!): «есть ли круг N» не
+        -- зависит от algo_version → колонка БЕЗ версии, пересчитывается при смене laps,
+        -- один раз на метку (не на метку×версию). Раствор ×algo_version (от streams+
+        -- резолвера), validation ×laps-без-версии. Производное следует за своим
+        -- источником, не за глобальным счётчиком.
+        --   'ok'         — вход провалидирован (at_time; или user_ref+круг N в laps есть)
+        --   'deferred'   — валидация отложена (user_ref='lapN', laps нет → N недоказуем)
+        --   'invalid'    — отложенная валидация провалена (laps есть, круга N нет).
+        --                  НЕ терминальна: validation=f(текущие laps) → при смене laps
+        --                  может ожить в 'ok'. invalid — производное, как раствор; ухода
+        --                  в invalid снимает раствор той метки (recompute-инвариант,
+        --                  реализуется в sync 8a: validation ПЕРЕД резолвом).
+        --
+        -- lap_count — ДОКАЗАТЕЛЬСТВО вердикта рядом с вердиктом: тот же f(laps), тот же
+        -- момент, та же беcверсионность. Нужен, чтобы invalid был самодостаточен на
+        -- чтении («круга N нет, в тренировке M кругов» — человек видит опечатку без
+        -- второго обращения), НЕ дочитывая laps из raw на compact (то касание raw
+        -- выпалывал B2). NULL = «неприменимо» (at_time-метка/заметка — кругового вопроса
+        -- нет) ИЛИ «ещё не вычислен» (deferred до laps). Читается ТОЛЬКО при
+        -- validation='invalid', где заведомо заполнен → NULL нигде не двусмыслен.
+        --
+        -- store ТУПОЙ: validation/lap_count он ХРАНИТ, но НЕ вычисляет и НЕ судит.
+        -- Вычисляет тот, у кого laps на руках: тул при немедленном резолве (add_lactate),
+        -- sync-ветка при recompute (батчем). id-чек «activity_id в каталоге» — тоже в
+        -- туле (8a), не здесь: store пишет что дали.
+        -- ─────────────────────────────────────────────────────────────────────
+
+        ALTER TABLE user_data ADD COLUMN validation TEXT NOT NULL DEFAULT 'ok';
+        ALTER TABLE user_data ADD COLUMN lap_count INTEGER;
         """,
     ),
 ]
@@ -572,26 +626,36 @@ class Store:
     def add_user_lactate(self, activity_id: int, mmol: float,
                          at_time: Optional[int] = None,
                          user_ref: Optional[str] = None,
-                         source: str = "llm") -> int:
+                         source: str = "llm",
+                         validation: str = "ok",
+                         lap_count: Optional[int] = None) -> int:
         """Записать НАМЕРЕНИЕ лактатной метки. Возвращает вечный mark_id.
 
         Привязка (lap/hr_at/pace_at) здесь НЕ вычисляется — это раствор, живёт в
         user_lactate_resolved, версионируется, резолвится из streams (enrich).
-        Хотя бы одно из at_time/user_ref должно быть задано (иначе метку некуда
-        привязать); проверку осмысленности входа делает вызывающий тул.
         at_time — wall-clock UTC мс (НЕ elapsed), см. миграцию v4.
+
+        validation/lap_count store ПРИНИМАЕТ готовыми, НЕ вычисляет (тупой слой):
+        их считает вызывающий (тул при немедленном резолве / sync при recompute),
+        у кого laps на руках. id-чек «activity_id в каталоге» — тоже в туле, не тут.
+        validation: 'ok' | 'deferred' | 'invalid' (см. миграцию v5). lap_count —
+        доказательство invalid («кругов M»), NULL если неприменимо/ещё не вычислен.
         """
         cur = self.conn.execute(
-            "INSERT INTO user_data(activity_id,kind,mmol,user_ref,at_time,source,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (activity_id, "lactate", float(mmol), user_ref, at_time, source, _iso_now()),
+            "INSERT INTO user_data(activity_id,kind,mmol,user_ref,at_time,source,"
+            "created_at,validation,lap_count) VALUES(?,?,?,?,?,?,?,?,?)",
+            (activity_id, "lactate", float(mmol), user_ref, at_time, source,
+             _iso_now(), validation, lap_count),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def add_note(self, activity_id: int, text: str, source: str = "llm") -> int:
         """Записать заметку (свободный текст, контекст для LLM). Возвращает mark_id.
-        Не фильтруется, не резолвится — раствора у заметки нет."""
+        Не резолвится — раствора у заметки нет. validation='ok' (DEFAULT): у заметки
+        нет user_ref/at_time → структурно валидировать нечего (deferred/invalid
+        неприменимы). НО id-чек «activity_id в каталоге» делает вызывающий тул ДО
+        этого вызова — иначе осиротевшая вечная заметка на галлюцинированном id."""
         cur = self.conn.execute(
             "INSERT INTO user_data(activity_id,kind,note_text,source,created_at) "
             "VALUES(?,?,?,?,?)",
@@ -608,13 +672,26 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def set_validation(self, mark_id: int, validation: str,
+                       lap_count: Optional[int] = None) -> None:
+        """Обновить вердикт валидности намерения (validation=f(текущие laps)).
+        Зовётся sync-веткой recompute: пересчитала validation из laps → пишет сюда.
+        validation БЕЗверсионна (зависит от laps, не от резолвера) — одна колонка,
+        не ×algo_version. lap_count едет вместе (доказательство вердикта, тот же f)."""
+        self.conn.execute(
+            "UPDATE user_data SET validation=?, lap_count=? WHERE mark_id=?",
+            (validation, lap_count, mark_id),
+        )
+        self.conn.commit()
+
     def get_user_data(self, activity_id: int) -> list[dict]:
-        """Сырые НАМЕРЕНИЯ по активности (без раствора). Для резолвера (enrich):
-        он берёт лактатные метки, резолвит привязку, пишет put_user_lactate_resolved.
+        """Сырые НАМЕРЕНИЯ по активности (без раствора), включая validation/lap_count.
+        Для sync/тула: пересчитать validation из текущих laps, резолвить ok из streams.
         """
         rows = self.conn.execute(
             "SELECT mark_id,activity_id,kind,mmol,user_ref,at_time,note_text,"
-            "source,created_at FROM user_data WHERE activity_id=? ORDER BY mark_id",
+            "source,created_at,validation,lap_count "
+            "FROM user_data WHERE activity_id=? ORDER BY mark_id",
             (activity_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -636,9 +713,8 @@ class Store:
         self.conn.commit()
 
     def clear_user_lactate_resolved(self, algo_version: str) -> int:
-        """Снести весь раствор данной версии (перед пересчётом резолвера).
-        recompute: DELETE версии → INSERT заново из user_data+streams. Намерение
-        (user_data) не участвует — read-only источник, как streams. Возвращает
+        """Снести ВЕСЬ раствор данной версии (полный recompute-проход: DELETE версии
+        → INSERT заново). Намерение (user_data) не участвует — read-only. Возвращает
         число удалённых строк."""
         cur = self.conn.execute(
             "DELETE FROM user_lactate_resolved WHERE algo_version=?", (algo_version,)
@@ -646,17 +722,34 @@ class Store:
         self.conn.commit()
         return cur.rowcount
 
+    def delete_user_lactate_resolved(self, mark_id: int, algo_version: str) -> bool:
+        """ТОЧЕЧНЫЙ снос раствора ОДНОЙ метки под версией. Нужен для инварианта
+        «invalid не несёт привязку»: метка ушла в invalid → sync снимает её раствор,
+        не трогая раствор валидных меток той же версии (в отличие от clear_ по всей
+        версии). Возвращает True если строка была."""
+        cur = self.conn.execute(
+            "DELETE FROM user_lactate_resolved WHERE mark_id=? AND algo_version=?",
+            (mark_id, algo_version),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def get_user_marks_resolved(self, activity_id: int,
                                 algo_version: str) -> list[dict]:
         """НАМЕРЕНИЕ ⨝ РАСТВОР по (mark_id, текущая algo_version) — для compact/full.
-        Streams НЕ читает (раствор уже в таблице). Если раствора текущей версии нет
-        (метку добавили, resolve ещё не прошёл) — лактат отдаётся с resolved='pending'
-        (легальное «привязка не вычислена», не ошибка, не дырка; §3.5.1 паттерн
-        определимости). Заметки идут как есть (раствора у них нет).
-        """
+        Streams/laps НЕ читает: статус берётся из ХРАНИМОГО validation, привязка — из
+        resolved. Расщепляет status по происхождению (не молчит — §3.5.2):
+          resolved           — validation='ok' и раствор текущей версии есть;
+          pending_resolve    — validation='ok', раствора нет (ждёт streams);
+          pending_validation — validation='deferred' (user_ref, laps нет → N недоказуем);
+          invalid            — validation='invalid' (круга N нет), с lap_count («кругов M»),
+                               БЕЗ привязки (invalid не несёт раствор, даже если строка
+                               залежалась — отдаём честный вердикт, не привязку).
+        Заметки идут как есть (раствора/валидации структурной у них нет)."""
         rows = self.conn.execute(
             "SELECT u.mark_id, u.kind, u.mmol, u.user_ref, u.at_time, u.note_text, "
-            "u.source, u.created_at, r.lap, r.hr_at, r.pace_at "
+            "u.source, u.created_at, u.validation, u.lap_count, "
+            "r.lap, r.hr_at, r.pace_at "
             "FROM user_data u "
             "LEFT JOIN user_lactate_resolved r "
             "  ON r.mark_id = u.mark_id AND r.algo_version = ? "
@@ -671,18 +764,27 @@ class Store:
                             "created_at": r["created_at"]})
                 continue
             # kind == lactate
-            has_resolved = r["lap"] is not None or r["hr_at"] is not None \
-                or r["pace_at"] is not None
             mark = {"mark_id": r["mark_id"], "kind": "lactate", "mmol": r["mmol"],
                     "at_time": r["at_time"], "user_ref": r["user_ref"],
                     "source": r["source"], "created_at": r["created_at"]}
-            if has_resolved:
-                mark["resolved"] = "resolved"
-                mark["lap"] = r["lap"]
-                mark["hr_at"] = r["hr_at"]
-                mark["pace_at"] = r["pace_at"]
-            else:
-                mark["resolved"] = "pending"  # метка есть, раствор версии не вычислен
+            v = r["validation"]
+            if v == "invalid":
+                # вердикт «круга N нет» + доказательство «кругов M». Привязку НЕ отдаём,
+                # даже если resolved-строка залежалась (invalid не несёт раствор).
+                mark["status"] = "invalid"
+                mark["lap_count"] = r["lap_count"]
+            elif v == "deferred":
+                mark["status"] = "pending_validation"   # ждёт laps для проверки N
+            else:  # v == 'ok'
+                has_resolved = r["lap"] is not None or r["hr_at"] is not None \
+                    or r["pace_at"] is not None
+                if has_resolved:
+                    mark["status"] = "resolved"
+                    mark["lap"] = r["lap"]
+                    mark["hr_at"] = r["hr_at"]
+                    mark["pace_at"] = r["pace_at"]
+                else:
+                    mark["status"] = "pending_resolve"   # провалидирован, ждёт streams
             out.append(mark)
         return out
 
@@ -797,48 +899,72 @@ if __name__ == "__main__":
         st.meta_set("download_policy", "all")
 
         # --- этап 7: user_data (намерение) + user_lactate_resolved (раствор) ---
-        assert st.schema_version == 4, st.schema_version
+        assert st.schema_version == 5, st.schema_version
         ver = "test-0.0.0"
-        # намерение: две лактатные метки + заметка
-        m1 = st.add_user_lactate(123, 6.0, at_time=1_700_000_150_000, source="llm")
-        m2 = st.add_user_lactate(123, 3.3, user_ref="lap4", source="manual")
+        # намерение: at_time-метка (ok), user_ref без laps (deferred), заметка
+        m1 = st.add_user_lactate(123, 6.0, at_time=1_700_000_150_000, source="llm")  # validation='ok'
+        m2 = st.add_user_lactate(123, 3.3, user_ref="lap4", source="manual",
+                                 validation="deferred")  # laps не было → deferred
         n1 = st.add_note(123, "интервалка 4x1км, лактат после 4-го", source="llm")
         assert m2 > m1 and n1 > m2, (m1, m2, n1)      # AUTOINCREMENT монотонен
         rows = st.get_user_data(123)
         assert len(rows) == 3, rows
         assert [r["kind"] for r in rows] == ["lactate", "lactate", "note"], rows
-        assert rows[0]["mmol"] == 6.0 and rows[0]["at_time"] == 1_700_000_150_000
-        assert rows[1]["user_ref"] == "lap4" and rows[1]["at_time"] is None
+        assert rows[0]["validation"] == "ok" and rows[1]["validation"] == "deferred"
+        assert rows[2]["validation"] == "ok"           # заметка: DEFAULT 'ok'
+        assert rows[0]["at_time"] == 1_700_000_150_000 and rows[1]["user_ref"] == "lap4"
 
-        # до резолва: лактат pending, заметка как есть
+        # четыре состояния чтения (status из ХРАНИМОГО validation):
         marks = st.get_user_marks_resolved(123, ver)
         by_id = {mk["mark_id"]: mk for mk in marks}
-        assert by_id[m1]["resolved"] == "pending", by_id[m1]
-        assert by_id[m2]["resolved"] == "pending", by_id[m2]
-        assert by_id[n1]["kind"] == "note" and "resolved" not in by_id[n1]
+        assert by_id[m1]["status"] == "pending_resolve", by_id[m1]   # ok, раствора нет
+        assert by_id[m2]["status"] == "pending_validation", by_id[m2]  # deferred (нет laps)
+        assert by_id[n1]["kind"] == "note" and "status" not in by_id[n1]
         assert by_id[n1]["text"].startswith("интервалка")
 
-        # раствор одной метки под версией → она resolved, вторая всё ещё pending
+        # раствор m1 → resolved; m2 всё ещё pending_validation
         st.put_user_lactate_resolved(m1, ver, lap=4, hr_at=185.0, pace_at=205.0)
-        marks = st.get_user_marks_resolved(123, ver)
-        by_id = {mk["mark_id"]: mk for mk in marks}
-        assert by_id[m1]["resolved"] == "resolved", by_id[m1]
-        assert by_id[m1]["hr_at"] == 185.0 and by_id[m1]["lap"] == 4
-        assert by_id[m2]["resolved"] == "pending", by_id[m2]
-        # раствор виден ТОЛЬКО под своей версией (изоляция по algo_version)
-        assert st.get_user_marks_resolved(123, "other-ver")[0]["resolved"] == "pending"
+        by_id = {mk["mark_id"]: mk for mk in st.get_user_marks_resolved(123, ver)}
+        assert by_id[m1]["status"] == "resolved" and by_id[m1]["hr_at"] == 185.0
+        assert by_id[m2]["status"] == "pending_validation", by_id[m2]
+        # раствор виден ТОЛЬКО под своей версией
+        assert st.get_user_marks_resolved(123, "other-ver")[0]["status"] == "pending_resolve"
 
-        # clear версии (перед пересчётом резолвера) → снова pending
-        assert st.clear_user_lactate_resolved(ver) == 1
-        assert st.get_user_marks_resolved(123, ver)[0]["resolved"] == "pending"
+        # deferred → laps дозакачались, круга 4 НЕТ (laps показали 3) → invalid + lap_count
+        st.set_validation(m2, "invalid", lap_count=3)
+        by_id = {mk["mark_id"]: mk for mk in st.get_user_marks_resolved(123, ver)}
+        assert by_id[m2]["status"] == "invalid", by_id[m2]
+        assert by_id[m2]["lap_count"] == 3, "invalid несёт доказательство «кругов M»"
+        assert "hr_at" not in by_id[m2], "invalid НЕ несёт привязку"
 
-        # жёсткое удаление + каскад в раствор
+        # invalid НЕ терминальна: laps пересобрались, круг 4 теперь есть → ok, оживает
+        st.set_validation(m2, "ok", lap_count=None)
+        assert st.get_user_marks_resolved(123, ver)[1]["status"] == "pending_resolve", \
+            "invalid→ok: метка ожила (ждёт streams), не мертва"
+
+        # инвариант «invalid не несёт привязку»: даже если раствор ЗАЛЕЖАЛСЯ, при invalid
+        # get_user_marks_resolved его не отдаёт (честный вердикт, не привязка)
         st.put_user_lactate_resolved(m2, ver, lap=4, hr_at=170.0, pace_at=None)
+        st.set_validation(m2, "invalid", lap_count=3)
+        stale = st.get_user_marks_resolved(123, ver)[1]
+        assert stale["status"] == "invalid" and "hr_at" not in stale, "залежавшийся раствор при invalid не отдаётся"
+        # точечный снос раствора ОДНОЙ метки (sync снимет при уходе в invalid), не трогая m1
+        assert st.delete_user_lactate_resolved(m2, ver) is True
+        assert st.conn.execute("SELECT COUNT(*) FROM user_lactate_resolved WHERE mark_id=?",
+                               (m2,)).fetchone()[0] == 0
+        assert st.conn.execute("SELECT COUNT(*) FROM user_lactate_resolved WHERE mark_id=?",
+                               (m1,)).fetchone()[0] == 1, "точечный снос m2 НЕ тронул раствор m1"
+
+        # clear ВСЕЙ версии → у m1 раствора нет, статус по validation='ok' → pending_resolve
+        assert st.clear_user_lactate_resolved(ver) == 1
+        assert st.get_user_marks_resolved(123, ver)[0]["status"] == "pending_resolve"
+
+        # жёсткое удаление + каскад
+        st.put_user_lactate_resolved(m1, ver, lap=4, hr_at=185.0, pace_at=205.0)
         assert st.delete_user_mark(m2) is True
-        assert len(st.get_user_data(123)) == 2                 # намерение удалено
-        assert st.conn.execute(                                # раствор снесён каскадом
-            "SELECT COUNT(*) FROM user_lactate_resolved WHERE mark_id=?", (m2,)
-        ).fetchone()[0] == 0
+        assert len(st.get_user_data(123)) == 2
+        assert st.conn.execute("SELECT COUNT(*) FROM user_lactate_resolved WHERE mark_id=?",
+                               (m2,)).fetchone()[0] == 0
         # mark_id НЕ переиспользуется после удаления
         m3 = st.add_user_lactate(123, 4.0, at_time=1_700_000_200_000)
         assert m3 > n1, (m3, n1)
