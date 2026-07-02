@@ -801,6 +801,38 @@ def resolve_mark(stream: dict, laps: Optional[dict], intent: dict,
     return {"lap": lap, "hr_at": hr_at, "pace_at": pace_at}
 
 
+def validate_mark(laps: Optional[dict], intent: dict) -> tuple[str, Optional[int]]:
+    """Вердикт валидности НАМЕРЕНИЯ из текущих laps: (validation, lap_count).
+
+    validation = f(laps) — БЕЗверсионно (не зависит от резолвера, только от структуры):
+      at_time задан            → ('ok', None)   — круговой вопрос неприменим
+      user_ref='lapN', laps нет → ('deferred', None) — N недоказуем (нет структуры)
+      user_ref='lapN', круг N ∈ [1..M] → ('ok', M)
+      user_ref='lapN', N вне [1..M]     → ('invalid', M)  — доказуемо нет круга N
+    Предполагает user_ref уже well-formed 'lapN' (формат-чек — в туле до записи) или None.
+    lap_count (M) едет при ok(user_ref)/invalid как ДОКАЗАТЕЛЬСТВО вердикта; NULL иначе.
+
+    ОДНА функция для двух мест (как resolve_mark): add_lactate (немедленно, свежий вход)
+    и recompute (батч). Вердикт один; ПОЛИТИКА по нему — у вызывающего: свежий вход с
+    'invalid' → ошибка входа (опечатка, не писать); существующая метка 'invalid' при
+    recompute → хранимое состояние (deferred→invalid при дозакачке laps).
+    """
+    at_time = intent.get("at_time")
+    user_ref = intent.get("user_ref")
+    if at_time is not None:
+        return ("ok", None)
+    if not user_ref:
+        return ("ok", None)   # защитно: «нечего привязывать» ловит тул до вызова
+    lap_list = (laps or {}).get("lapDTOs") or []
+    if not lap_list:
+        return ("deferred", None)   # laps нет → N недоказуем
+    m = _LAP_RE.search(str(user_ref))
+    lap_count = len(lap_list)
+    if m and 1 <= int(m.group(1)) <= lap_count:
+        return ("ok", lap_count)
+    return ("invalid", lap_count)   # круга N доказуемо нет; M — доказательство
+
+
 def histogram_shape(hist: dict) -> dict:
     """Сворачивает гистограмму {бакет: секунды} в ФОРМУ (МЕТОД §3.1), не среднее.
 
@@ -1263,5 +1295,16 @@ if __name__ == "__main__":
     # (i) user_ref без laps → None (нечего накапливать)
     assert resolve_mark(sm, None, {"at_time": None, "user_ref": "lap1"}) is None, \
         "user_ref без laps → None"
+
+    # --- этап 7: validate_mark (вердикт из laps, versionless) ---
+    laps2 = {"lapDTOs": [{"elapsedDuration": 150.0}, {"elapsedDuration": 150.0}]}  # M=2
+    assert validate_mark(None, {"at_time": 123, "user_ref": None}) == ("ok", None), "at_time → ok"
+    assert validate_mark(laps2, {"at_time": None, "user_ref": "lap1"}) == ("ok", 2), "круг 1 ∈[1..2] → ok"
+    assert validate_mark(laps2, {"at_time": None, "user_ref": "lap2"}) == ("ok", 2)
+    assert validate_mark(laps2, {"at_time": None, "user_ref": "lap5"}) == ("invalid", 2), \
+        "круга 5 нет (M=2) → invalid + доказательство M=2"
+    assert validate_mark(None, {"at_time": None, "user_ref": "lap4"}) == ("deferred", None), \
+        "laps нет → deferred (N недоказуем)"
+    assert validate_mark({"lapDTOs": []}, {"at_time": None, "user_ref": "lap4"}) == ("deferred", None)
 
     print("\nself-test OK")
