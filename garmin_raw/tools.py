@@ -169,6 +169,14 @@ def get_activity_full(slug: str, activity_id: int) -> dict:
     return out
 
 
+def cache_status(slug: str) -> dict:
+    """Состояние кэша профиля (для LLM: что вообще есть, без сети). Профиль-нейтрально:
+    store.status() отдаёт schema_version/algo_version/counts/range/last_sync/db_bytes,
+    без slug/путей. Тонкая обёртка над Store.status()."""
+    with Store(profiles.resolve(slug).db_path) as st:
+        return st.status()
+
+
 def get_period_aggregates(slug: str, period_key: Optional[str] = None) -> dict:
     """Кросс-агрегаты по периодам (этап 5, §3.5). Якорь-нейтральные, БЕЗ имён/зон.
 
