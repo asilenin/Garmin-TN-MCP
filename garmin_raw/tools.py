@@ -210,20 +210,93 @@ def get_period_aggregates(slug: str, period_key: Optional[str] = None) -> dict:
 _LAP_REF_RE = re.compile(r"\s*lap\s*\d+\s*", re.IGNORECASE)
 
 
+def _stream_first_ts(stream: Optional[dict]) -> Optional[float]:
+    """Первая секунда потока (directTimestamp[0]) — тот же clock, что argmin резолвера.
+    Лёгкий парс без numpy (нужно одно число, не весь массив)."""
+    if not stream:
+        return None
+    rows = stream.get("activityDetailMetrics") or []
+    descs = stream.get("metricDescriptors") or []
+    if not rows:
+        return None
+    ts_idx = next((m.get("metricsIndex") for m in descs
+                   if m.get("key") == "directTimestamp"), None)
+    if ts_idx is None:
+        return None
+    mv = rows[0].get("metrics", [])
+    v = mv[ts_idx] if ts_idx < len(mv) else None
+    return float(v) if v is not None else None
+
+
+def _gmt_to_ms(s: Optional[str]) -> Optional[int]:
+    """GMT-строка ('YYYY-MM-DD HH:MM:SS' / ISO с 'T' и долями) → эпоха-мс UTC.
+    Последний фолбэк якоря: парсинг строки, точность зависит от формата."""
+    if not s:
+        return None
+    from datetime import datetime, timezone
+    t = str(s).strip().replace("T", " ")
+    if "." in t:
+        t = t.split(".", 1)[0]
+    try:
+        dt = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _activity_start_ms(st: Store, activity_id: int,
+                       stream: Optional[dict]) -> tuple[Optional[int], str]:
+    """Якорь старта для конвертации elapsed→wall-clock. Возвращает (start_ms, source).
+
+    Порядок (QA этап7): ts[0] когда streams есть (тот же ноль, что argmin — рассинхрон
+    невозможен по построению; поток уже открыт для резолва → бесплатно) → beginTimestamp
+    из summary_json (эпоха-мс, без потока; streams нет → метка pending, at_time для
+    будущего резолва) → start_time GMT-строка (парсинг) → None.
+    'человек пишет elapsed от НАЧАЛА ЗАПИСИ = ts[0]' — ts[0] и семантически ближе.
+    """
+    ts0 = _stream_first_ts(stream)
+    if ts0 is not None:
+        return int(ts0), "stream_ts0"
+    row = st.conn.execute(
+        "SELECT summary_json, start_time FROM activities WHERE activity_id=?",
+        (activity_id,)).fetchone()
+    if row is not None:
+        if row["summary_json"]:
+            try:
+                bt = json.loads(row["summary_json"]).get("beginTimestamp")
+                if bt is not None:
+                    return int(bt), "beginTimestamp"
+            except (ValueError, TypeError):
+                pass
+        gm = _gmt_to_ms(row["start_time"])
+        if gm is not None:
+            return gm, "start_time_gmt"
+    return None, "none"
+
+
 def add_lactate(slug: str, activity_id: int, mmol: float,
-                at_time: Optional[int] = None,
+                at_ms: Optional[int] = None,
+                at_elapsed_s: Optional[float] = None,
                 user_ref: Optional[str] = None,
                 source: str = "llm") -> dict:
-    """Внести лактатный замер к тренидровке (namerenie). Возвращает {mark_id, status}.
+    """Внести лактатный замер к тренировке (namerenie). Возвращает {mark_id, status}.
 
-    at_time — wall-clock UTC мс (приоритет); user_ref='lapN' — конец Garmin-круга N.
-    Хотя бы одно задано. Валидация входа (не угадывание — проверка фактов):
-      activity_id не в каталоге         → {"error": "activity not found"}
-      ни at_time, ни user_ref           → {"error": "need at_time or user_ref"}
-      user_ref не 'lapN'                → {"error": "user_ref malformed"}
-      user_ref='lapN', laps есть, N нет → {"error": "lap N not found (has M)"} (опечатка)
+    Три формы указания секунды (все канонизируются в at_time = wall-clock UTC мс,
+    хранится ОДИН формат — §B2):
+      at_ms        — сырой wall-clock UTC мс (эталонный/точный путь);
+      at_elapsed_s — секунды ОТ СТАРТА ЗАПИСИ (как человек пишет: '36:30'→2190);
+                     конвертится якорем старта (ts[0]→beginTimestamp→start_time);
+      user_ref     — 'lapN' (структурный, без времени; конец Garmin-круга N).
+    Приоритет at_ms > at_elapsed_s (оба → at_time); at_time приоритетнее user_ref.
+
+    Валидация входа (проверка фактов, не угадывание):
+      activity_id не в каталоге          → error activity not found
+      at_elapsed_s задан, якоря нет      → error cannot anchor elapsed
+      ни времени, ни user_ref            → error need at_time or user_ref
+      user_ref не 'lapN'                 → error user_ref malformed
+      user_ref='lapN', laps есть, N нет  → error lap not found (has M) (опечатка)
     Иначе пишет namerenie с validation (ok/deferred) и НЕМЕДЛЕННО резолвит из кэша
-    под текущей algo_version (streams есть → resolved; нет → pending_resolve).
+    под текущей algo_version (streams есть → resolved; нет → pending_resolve). CACHE-ONLY.
     """
     from enrich import resolve_mark, validate_mark
 
@@ -231,12 +304,25 @@ def add_lactate(slug: str, activity_id: int, mmol: float,
         if st.conn.execute("SELECT 1 FROM activities WHERE activity_id=?",
                             (activity_id,)).fetchone() is None:
             return {"error": f"activity {activity_id} not found"}
+
+        laps = st.get_raw(activity_id, "laps")            # только кэш, без сети
+        stream = st.get_raw(activity_id, "streams")       # один раз: якорь + резолв
+
+        # канонизация времени входа → at_time (wall-clock UTC мс)
+        at_time: Optional[int] = None
+        if at_ms is not None:
+            at_time = int(at_ms)                          # уже wall-clock
+        elif at_elapsed_s is not None:
+            start_ms, _src = _activity_start_ms(st, activity_id, stream)
+            if start_ms is None:
+                return {"error": "cannot anchor elapsed (no start in cache)"}
+            at_time = int(start_ms + float(at_elapsed_s) * 1000.0)
+
         if at_time is None and not user_ref:
             return {"error": "need at_time or user_ref"}
         if user_ref is not None and not _LAP_REF_RE.fullmatch(str(user_ref)):
             return {"error": f"user_ref malformed: {user_ref!r} (expected 'lapN')"}
 
-        laps = st.get_raw(activity_id, "laps")            # только кэш, без сети
         intent = {"at_time": at_time, "user_ref": user_ref}
         validation, lap_count = validate_mark(laps, intent)
         # свежий вход: 'invalid' = опечатка (круга N доказуемо нет) → ошибка, НЕ пишем
@@ -251,15 +337,14 @@ def add_lactate(slug: str, activity_id: int, mmol: float,
         # немедленный резолв ТОЛЬКО для ok + streams в кэше, под ТЕКУЩЕЙ версией
         status = "pending_validation" if validation == "deferred" else "pending_resolve"
         av = st.meta_get("algo_version")
-        if validation == "ok" and av is not None:
-            stream = st.get_raw(activity_id, "streams")   # только кэш
-            if stream is not None:
-                binding = resolve_mark(stream, laps, intent, av)
-                if binding is not None:
-                    st.put_user_lactate_resolved(mark_id, av, binding["lap"],
-                                                 binding["hr_at"], binding["pace_at"])
-                    status = "resolved"
-        out = {"mark_id": mark_id, "status": status}
+        binding = None
+        if validation == "ok" and av is not None and stream is not None:
+            binding = resolve_mark(stream, laps, intent, av)
+            if binding is not None:
+                st.put_user_lactate_resolved(mark_id, av, binding["lap"],
+                                             binding["hr_at"], binding["pace_at"])
+                status = "resolved"
+        out = {"mark_id": mark_id, "status": status, "at_time": at_time}
         if status == "resolved":
             out.update({k: binding[k] for k in ("lap", "hr_at", "pace_at")})
         return out
@@ -308,16 +393,25 @@ if __name__ == "__main__":
         print(json.dumps(get_activity_full(slug, int(sys.argv[3])),
                          ensure_ascii=False, indent=2))
     elif cmd == "add-lactate":
-        # python tools.py <slug> add-lactate <activity_id> <mmol> [--at-time MS | --user-ref lapN]
+        # python tools.py <slug> add-lactate <activity_id> <mmol>
+        #   [--at-ms <wall-clock-мс> | --at-elapsed <mm:ss|сек> | --user-ref lapN]
         aid, mmol = int(sys.argv[3]), float(sys.argv[4])
-        at_time = user_ref = None
+        at_ms = at_elapsed_s = user_ref = None
         rest = sys.argv[5:]
         for i, a in enumerate(rest):
-            if a == "--at-time" and i + 1 < len(rest):
-                at_time = int(rest[i + 1])
+            if a == "--at-ms" and i + 1 < len(rest):
+                at_ms = int(rest[i + 1])
+            elif a == "--at-elapsed" and i + 1 < len(rest):
+                v = rest[i + 1]
+                if ":" in v:                      # mm:ss (как человек пишет)
+                    mm, ss = v.split(":", 1)
+                    at_elapsed_s = int(mm) * 60 + int(ss)
+                else:
+                    at_elapsed_s = float(v)       # сырые секунды
             elif a == "--user-ref" and i + 1 < len(rest):
                 user_ref = rest[i + 1]
-        res = add_lactate(slug, aid, mmol, at_time=at_time, user_ref=user_ref)
+        res = add_lactate(slug, aid, mmol, at_ms=at_ms,
+                          at_elapsed_s=at_elapsed_s, user_ref=user_ref)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         sys.exit(1 if "error" in res else 0)   # ошибка входа → ненулевой код (CLI-контракт)
     elif cmd == "add-note":
