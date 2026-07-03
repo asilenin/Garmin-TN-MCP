@@ -57,10 +57,20 @@ def resolve(slug: str) -> Profile:
             f"Недопустимый slug {slug!r}: разрешены [a-z0-9_-], начинается с буквы/цифры."
         )
     base = ROOT / "profiles" / slug
-    # legacy: явный GARMIN_TOKENSTORE переопределяет каталог токенов (обратная
-    # совместимость с текущим backend.py, где TOKENSTORE = env(GARMIN_TOKENSTORE))
+    # Токены (I3 backlog): ПРОФИЛЬ-first → фолбэк на общий GARMIN_TOKENSTORE.
+    # НЕ «общий всегда»: профиль со своими токенами (разный Garmin-аккаунт) обязан
+    # использовать их, иначе один сервер тянет из Garmin под чужим аккаунтом.
+    # Проверяем НЕПУСТОТУ, не .exists(): ensure_dirs()/create() сами создают пустой
+    # profiles/<slug>/tokens/ — по .exists() он затенил бы фолбэк навсегда. Пустая
+    # профильная папка → игнорируем, идём на общий (или дефолт-путь для будущего auth).
+    prof_tokens = base / "tokens"
     legacy = os.environ.get("GARMIN_TOKENSTORE")
-    tokens_dir = Path(legacy).expanduser() if legacy else base / "tokens"
+    if prof_tokens.is_dir() and any(prof_tokens.iterdir()):
+        tokens_dir = prof_tokens                       # профиль имеет свои токены
+    elif legacy:
+        tokens_dir = Path(legacy).expanduser()         # фолбэк на общий
+    else:
+        tokens_dir = prof_tokens                       # дефолт: сюда auth положит токены
     return Profile(
         slug=slug,
         base=base,
@@ -139,8 +149,38 @@ def remove(slug: str, *, wipe: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    # быстрый осмотр: что зарегистрировано и куда резолвится
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+        import tempfile
+        # T7.5-1: токен-резолв профиль-first → фолбэк общий, с ловушкой пустой папки
+        with tempfile.TemporaryDirectory() as d:
+            P = sys.modules[__name__]
+            P.ROOT = Path(d)                    # resolve() читает ROOT как глобал при вызове
+            shared = Path(d) / "shared"; shared.mkdir(); (shared / "garmin_tokens.json").write_text("{}")
+            os.environ["GARMIN_TOKENSTORE"] = str(shared)
+
+            # (1) нет профильных токенов → фолбэк на общий
+            p = P.resolve("anton")
+            assert p.tokens_dir == shared, ("fallback", p.tokens_dir)
+
+            # (2) профильные токены есть и НЕПУСТЫ → профиль-first (перебивает общий)
+            pt = Path(d) / "profiles" / "mila" / "tokens"; pt.mkdir(parents=True)
+            (pt / "oauth.json").write_text("{}")
+            p = P.resolve("mila")
+            assert p.tokens_dir == pt, ("profile-first", p.tokens_dir)
+
+            # (3) ЛОВУШКА: профильная папка есть, но ПУСТА → игнор, фолбэк на общий
+            empty = Path(d) / "profiles" / "bob" / "tokens"; empty.mkdir(parents=True)
+            p = P.resolve("bob")
+            assert p.tokens_dir == shared, ("empty-dir → fallback", p.tokens_dir)
+
+            # (4) ни профильных, ни общего → дефолт-путь (auth туда положит)
+            del os.environ["GARMIN_TOKENSTORE"]
+            p = P.resolve("carol")
+            assert p.tokens_dir == Path(d) / "profiles" / "carol" / "tokens", p.tokens_dir
+        print("profiles self-test OK")
+        sys.exit(0)
+    # быстрый осмотр: что зарегистрировано и куда резолвится
     if len(sys.argv) > 1:
         p = resolve(sys.argv[1])
         print(f"slug={p.slug}")
