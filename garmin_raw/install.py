@@ -97,5 +97,87 @@ def uninstall() -> None:
     )
 
 
+def _repo_from(repo_arg: str | None) -> Path:
+    repo = (Path(repo_arg).expanduser().resolve() if repo_arg
+            else Path(__file__).resolve().parents[1])
+    if not (repo / "pyproject.toml").exists():
+        sys.exit(f"В {repo} нет pyproject.toml — укажи путь к репозиторию аргументом.")
+    return repo
+
+
+def _parse_tn_args(argv: list[str]) -> tuple[str, str | None, str | None]:
+    """<slug> [repo] [--tokenstore PATH]. Возвращает (slug, repo|None, tokenstore|None)."""
+    args, positional, tokenstore = argv[1:], [], None
+    i = 0
+    while i < len(args):
+        if args[i] == "--tokenstore":
+            i += 1
+            if i >= len(args):
+                sys.exit("--tokenstore требует путь")
+            tokenstore = args[i]
+        else:
+            positional.append(args[i])
+        i += 1
+    if not positional:
+        sys.exit("Использование: garmin-tn-install <slug> [repo] [--tokenstore PATH]")
+    return positional[0], (positional[1] if len(positional) > 1 else None), tokenstore
+
+
+def install_tn() -> None:
+    """Профильный enriched-коннектор в конфиг Claude. Ключ garmin-tn-<slug>, env
+    GARMIN_TN_PROFILE=<slug> (профиль выбирается транспортом, не моделью — QA 7.5 Q1).
+    GARMIN_TOKENSTORE — ТОЛЬКО по флагу --tokenstore (не дефолт: хардкод личного пути
+    заглушил бы диагностику 'профиль не настроен' на чужой машине)."""
+    try:                       # install — пакетный entry (from .), тест — флэт (import)
+        from . import profiles
+    except ImportError:
+        import profiles
+
+    slug, repo_arg, tokenstore = _parse_tn_args(sys.argv)
+    if not profiles._valid_slug(slug):
+        sys.exit(f"Недопустимый slug {slug!r}: [a-z0-9_-], начинается с буквы/цифры.")
+    cfg, repo, uv = _config_path(), _repo_from(repo_arg), _uv_bin()
+    key = f"garmin-tn-{slug}"
+    env = {"GARMIN_TN_PROFILE": slug}
+    if tokenstore:
+        env["GARMIN_TOKENSTORE"] = str(Path(tokenstore).expanduser())
+
+    data = _load(cfg)
+    data.setdefault("mcpServers", {})[key] = {
+        "command": uv,
+        "args": ["--directory", str(repo), "run", "garmin-tn-mcp"],
+        "env": env,
+    }
+    _save(cfg, data)
+
+    # Грабля первой установки: профиль без СВОИХ токенов и без --tokenstore → auth
+    # упадёт. Критерий — НЕПУСТОТА profiles/<slug>/tokens (тот же, что resolve в T7.5-1;
+    # .exists() обманулся бы на пустой папке от ensure_dirs). Предупреждаем, не отказ.
+    prof_tokens = profiles.ROOT / "profiles" / slug / "tokens"
+    has_own = prof_tokens.is_dir() and any(prof_tokens.iterdir())
+    warn = ""
+    if not has_own and not tokenstore:
+        warn = (f"\n⚠ profile '{slug}': нет своих токенов ({prof_tokens}) и не задан "
+                f"--tokenstore.\n  auth упадёт при первом вызове. Передай "
+                f"--tokenstore <path> (напр. ~/.garminconnect) ИЛИ положи токены в "
+                f"{prof_tokens}.")
+    print(f"OK: '{key}' прописан в {cfg}\n  uv:   {uv}\n  repo: {repo}\n  env:  {env}\n"
+          f"Перезапусти Claude Desktop (Cmd+Q).{warn}")
+
+
+def uninstall_tn() -> None:
+    """Убрать профильный enriched-коннектор garmin-tn-<slug>. Сырьевой garmin-raw и
+    другие профили не трогаются."""
+    slug, _, _ = _parse_tn_args(sys.argv)
+    cfg = _config_path()
+    key = f"garmin-tn-{slug}"
+    data = _load(cfg)
+    if data.get("mcpServers", {}).pop(key, None) is None:
+        print(f"'{key}' не найден в {cfg} — нечего удалять.")
+        return
+    _save(cfg, data)
+    print(f"OK: '{key}' удалён из {cfg}. Перезапусти Claude Desktop (Cmd+Q).")
+
+
 if __name__ == "__main__":
     main()

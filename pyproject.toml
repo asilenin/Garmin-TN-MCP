@@ -16,6 +16,9 @@ garmin-raw-export = "garmin_raw.export:main"
 garmin-raw-mcp = "garmin_raw.server:main"
 garmin-raw-install = "garmin_raw.install:main"
 garmin-raw-uninstall = "garmin_raw.install:uninstall"
+garmin-tn-mcp = "garmin_raw.server_enriched:main"
+garmin-tn-install = "garmin_raw.install:install_tn"
+garmin-tn-uninstall = "garmin_raw.install:uninstall_tn"
 
 [build-system]
 requires = ["hatchling"]
