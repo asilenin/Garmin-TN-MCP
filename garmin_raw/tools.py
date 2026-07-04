@@ -95,10 +95,20 @@ def _load_enriched(st: Store, slug: str, aid: int) -> Optional[dict]:
 def _catalog_row(st: Store, aid: int) -> Optional[dict]:
     r = st.conn.execute(
         "SELECT activity_id,date,sport,distance_m,duration_s,moving_time_s,max_hr,"
-        "avg_cadence,avg_hr_raw,has_biomech_sensor,lap_count "
+        "avg_cadence,avg_hr_raw,has_biomech_sensor,lap_count,hr_source,device_model "
         "FROM activities WHERE activity_id=?", (aid,)
     ).fetchone()
-    return dict(r) if r else None
+    if r is None:
+        return None
+    row = dict(r)
+    # hr_source/device_model — условная эмиссия (7.6-2a): NULL (не посчитано,
+    # нет enriched) → ключа НЕТ; 'unknown' (посчитано: источник не разложен, Q12/Q15)
+    # → отдаётся КАК ЗНАЧЕНИЕ. Схлопнуть NULL и unknown нельзя: LLM обязан видеть
+    # «не знаю» как факт (§5.4 — пульсовая динамика под флагом источника).
+    for k in ("hr_source", "device_model"):
+        if row.get(k) is None:
+            row.pop(k, None)
+    return row
 
 
 def get_activity_compact(slug: str, activity_id: int) -> dict:
