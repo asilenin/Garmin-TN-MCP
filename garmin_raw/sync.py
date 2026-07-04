@@ -473,6 +473,8 @@ if __name__ == "__main__":
               f"pending {um['pending_resolve']}, invalid {um['invalid']}, deferred {um['deferred']}")
         sys.stdout.flush()
         os._exit(0)
+
+    if len(sys.argv) > 2 and sys.argv[2] == "aggregate":
         # python sync.py <slug> aggregate — кросс-агрегаты по периодам (этап 5).
         # Офлайн, без сети: читает только enriched + каталог (не streams).
         import profiles as _pf
