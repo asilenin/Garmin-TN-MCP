@@ -130,6 +130,38 @@ _c2 = tools.get_activity_compact(SLUG, 222)
 assert "hr_source" not in _c2 and "device_model" not in _c2, _c2
 print("I 7.6-2a: hr_source условная эмиссия (unknown=значение, NULL=нет ключа) OK")
 
+# --- 7.6-2(a'): upsert каталога не перетирает enrich-owned; INSERT несёт сид ---
+# Wipe-класс: UPDATE-ветка upsert затирала hr_source/moving_time_s/max_hr сидами
+# summary при каждом синке. Страж двух веток: (1) UPDATE после put_enriched не
+# трогает enrich-owned, summary-owned обновляет; (2) INSERT новой строки несёт
+# сид moving_time_s/max_hr (иначе query_index по max_hr теряет новые до enrich).
+from store import activity_row_from_summary
+_summary = {"activityId": 555, "startTimeGMT": "2026-07-01 06:00:00",
+            "activityType": {"typeKey": "running"}, "distance": 10000.0,
+            "duration": 3000.0, "movingDuration": 2900.0, "maxHR": 208,
+            "averageHR": 150, "averageSpeed": 3.3,
+            "averageRunningCadenceInStepsPerMinute": 176}
+with Store(prof.db_path) as st:
+    st.upsert_activities([activity_row_from_summary(_summary)])
+    r5 = st.conn.execute("SELECT moving_time_s,max_hr,hr_source FROM activities "
+                         "WHERE activity_id=555").fetchone()
+    assert r5["moving_time_s"] == 2900.0 and r5["max_hr"] == 208, dict(r5)   # INSERT: сид на месте
+    assert r5["hr_source"] is None
+    # enrich уточнил (эмуляция подъёма put_enriched: прямой UPDATE тех же трёх полей)
+    st.conn.execute("UPDATE activities SET moving_time_s=2750.0, max_hr=199, "
+                    "hr_source='chest' WHERE activity_id=555")
+    st.conn.commit()
+    # повторный синк каталога: тот же summary (avg_hr_raw сменим — summary-owned)
+    _summary["averageHR"] = 151
+    st.upsert_activities([activity_row_from_summary(_summary)])
+    r5 = st.conn.execute("SELECT moving_time_s,max_hr,hr_source,avg_hr_raw FROM activities "
+                         "WHERE activity_id=555").fetchone()
+    assert r5["moving_time_s"] == 2750.0, dict(r5)     # enrich-owned выжил
+    assert r5["max_hr"] == 199, dict(r5)
+    assert r5["hr_source"] == "chest", dict(r5)
+    assert r5["avg_hr_raw"] == 151, dict(r5)           # summary-owned обновился
+print("J 7.6-2a': upsert не трогает enrich-owned, INSERT несёт сид OK")
+
 # --- ЗАМОК профиль-нейтральности возврата (I2 / QA 7.5 Q4) ---
 # slug виден функции, невидим модели. Модель видит ВОЗВРАТ семи функций этапа 7 →
 # в нём не должно быть ни имён-ключей профиля, ни значений (путей/slug) этого профиля.

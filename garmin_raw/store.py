@@ -385,12 +385,30 @@ class Store:
         "gps_type", "biomech_source", "summary_json",
     )
 
+    # enrich-owned колонки каталога (7.6-2a'): истина — enrich, не summary.
+    # UPDATE-ветка upsert их НЕ трогает (иначе каждый синк каталога перетирает
+    # уточнённые значения сидами из summary — wipe, стерший hr_source на живых БД).
+    # INSERT-ветка сиды сохраняет (новая строка живёт с ними до обогащения).
+    # Критерий владения — источник истины колонки:
+    #   hr_source        — только из потока (Q15), summary не знает;
+    #   moving_time_s    — свой расчёт enrich (§1.5), movingDuration — лишь сид;
+    #   max_hr           — 99-й перцентиль enrich (§2.4), maxHR summary — лишь сид;
+    #   gps_validated / gps_type / biomech_source — извлечение назначено enrich-слою
+    #   контрактом Q12/ТЗ (версионируемо, из сырья) — исключены заранее, чтобы
+    #   T7.6-2(b) не наступил на тот же wipe; сейчас NULL с обеих сторон, безвредно.
+    _ENRICH_OWNED_ACT_COLS = frozenset({
+        "hr_source", "moving_time_s", "max_hr",
+        "gps_validated", "gps_type", "biomech_source",
+    })
+
     def upsert_activities(self, rows: Iterable[dict]) -> int:
-        """Вставка/обновление каталожных строк. Не затирает поля, которых нет в row,
-        кроме явно переданных. Возвращает число обработанных строк."""
+        """Вставка/обновление каталожных строк. summary-owned колонки обновляются;
+        enrich-owned (_ENRICH_OWNED_ACT_COLS) в UPDATE не трогаются — их истина
+        приходит из put_enriched, синк её не откатывает. Возвращает число строк."""
         cols = self._ACT_COLS
         placeholders = ",".join("?" for _ in cols)
-        updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "activity_id")
+        updates = ",".join(f"{c}=excluded.{c}" for c in cols
+                           if c != "activity_id" and c not in self._ENRICH_OWNED_ACT_COLS)
         sql = (
             f"INSERT INTO activities ({','.join(cols)}) VALUES ({placeholders}) "
             f"ON CONFLICT(activity_id) DO UPDATE SET {updates}"
