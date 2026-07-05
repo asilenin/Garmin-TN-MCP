@@ -11,7 +11,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "garmin_raw"))  # якорь — __file__, не cwd
 
 import profiles, tools, sync
-from store import Store
+from store import Store, SCHEMA_VERSION
 
 SLUG = "testp"
 prof = profiles.resolve(SLUG); prof.ensure_dirs()
@@ -27,7 +27,7 @@ def make_stream(ts0=base, n=300):
 LAPS2 = {"lapDTOs": [{"elapsedDuration":150.0}, {"elapsedDuration":150.0}]}
 
 with Store(prof.db_path) as st:
-    assert st.schema_version == 5
+    assert st.schema_version == SCHEMA_VERSION
     for aid in (111, 222):
         st.conn.execute("INSERT INTO activities(activity_id,date,sport) VALUES(?,?,?)",
                         (aid, "2026-06-27", "running"))

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Версия СХЕМЫ БД (структура таблиц). НЕ путать с ALGO_VERSION (версия формул).
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 # --------------------------------------------------------------------------- #
@@ -300,6 +300,64 @@ _MIGRATIONS: list[tuple[int, str]] = [
 
         ALTER TABLE user_data ADD COLUMN validation TEXT NOT NULL DEFAULT 'ok';
         ALTER TABLE user_data ADD COLUMN lap_count INTEGER;
+        """,
+    ),
+    (
+        6,
+        """
+        -- ─────────────────────────────────────────────────────────────────────
+        -- Миграция v6 (этап 7.6). wellness-кэш: сон/HRV/RHR/стресс/BodyBattery за
+        -- дату. НОВАЯ таблица (CREATE), НЕ трогает activity_raw/activities/enriched/
+        -- user_data — аддитивна, как v4. Существующие данные не затрагиваются.
+        --
+        -- ОТДЕЛЬНЫЙ КЛАСС ДАННЫХ, не сырьё (QA 7.6 Q6). activity_raw живёт по инварианту
+        -- «прошлое неизменно → кэш навечно». Wellness Garmin ПЕРЕСЧИТЫВАЕТ задним числом
+        -- (ночь дописывается утром, HRV-статус ре-калибруется на 7-дневном окне) →
+        -- инвариант неприменим ПО ПРИРОДЕ данных. Отсюда fetched_at обязателен как факт
+        -- свежести (не оптимизация): свежесть СУДИТ LLM по возрасту даты и fetched_at,
+        -- TTL-числа в коде НЕТ (число «сколько до стабильности» = порог о чужой системе).
+        --
+        -- PER-ЗОНД СТРОКИ (PK date,probe), не одна строка с пятью payload-колонками.
+        -- Пять зондов — три сервиса Garmin (/wellness-service, /hrv-service,
+        -- /userstats-service), пять URL, деградируют НЕЗАВИСИМО (замер probe_wellness).
+        -- Одна строка схлопнула бы fetched_at в общий — но зонды дозревают по-разному
+        -- (сон стабилен с утра, HRV 7 дней). Раздельные строки: у каждого зонда свой
+        -- fetched_at и свой статус, пишутся независимо (один упал — четыре записались).
+        --
+        -- status — явный, не выводимый из присутствия payload (иначе пустой payload
+        -- неоднозначен: «Garmin вернул пусто» vs «не ходили»). Три значения СОСТОЯВШЕГОСЯ
+        -- похода; «не ходили» = ОТСУТСТВИЕ строки (не значение статуса — иначе два
+        -- представления «не ходили», рассинхрон):
+        --   'ok'    — данные есть (payload непустой);
+        --   'empty' — сходили, Garmin вернул пусто (данных за дату нет — СТАБИЛЬНО,
+        --             перекачивать бессмысленно);
+        --   'error' — сходили, зонд упал (429/битый JSON/метод не резолвнут —
+        --             ТРАНЗИЕНТНО либо версионно; перекачать может помочь).
+        -- 'empty' и 'error' РАЗДЕЛЕНЫ: первое стабильно, второе транзиентно — схлопнуть
+        -- = не отличить «нечего качать» от «в тот раз не вышло» (класс ошибки треда).
+        --
+        -- detail — текст причины ТОЛЬКО при error (NULL для ok/empty). Различие
+        -- «метод не резолвнут» (постоянно для версии garminconnect) vs «429» (транзиентно)
+        -- — суждение LLM «перекачивать ли», не факт схемы → не четвёртый статус, а деталь.
+        --
+        -- payload — сжатый zlib JSON (как activity_raw), полный набор зонда БЕЗ резки
+        -- полей (Q6 разв. C: body_battery/stress derived — сигналы состояния для LLM,
+        -- не «чужая классификация тренировки» §0; резать в коде = зашить суждение).
+        -- PII: в теле пяти зондов персональных данных НЕТ (probe-дамп проверен глазами +
+        -- скан паттернов), userProfileId только в URL — URL НЕ хранится. deviceId в
+        -- теле = device_model каталога (тот же namespace, факт железа, не личность —
+        -- решение activities переносится: свойство значения, не контекста).
+        -- ─────────────────────────────────────────────────────────────────────
+
+        CREATE TABLE IF NOT EXISTS wellness_cache (
+            date        TEXT NOT NULL,     -- 'YYYY-MM-DD' запрашиваемой даты
+            probe       TEXT NOT NULL,     -- 'sleep'|'hrv'|'rhr'|'stress'|'body_battery'
+            status      TEXT NOT NULL,     -- 'ok'|'empty'|'error' (состоявшийся поход)
+            detail      TEXT,              -- текст причины при error; NULL иначе
+            payload     BLOB,              -- zlib JSON зонда; NULL при empty/error
+            fetched_at  TEXT NOT NULL,     -- ISO UTC когда скачали (факт свежести)
+            PRIMARY KEY (date, probe)
+        );
         """,
     ),
 ]
@@ -638,6 +696,48 @@ class Store:
         return _decompress(row["payload"]) if row else None
 
     # ------------------------------------------------------------------ #
+    # wellness_cache (этап 7.6, v6). Отдельный класс — НЕ сырьё: Garmin пересчитывает
+    # задним числом, свежесть судит LLM по fetched_at+возраст даты (TTL-числа в коде
+    # нет). store ТУПОЙ: хранит status/detail что дали, НЕ судит свежесть и НЕ решает,
+    # перекачивать ли. Per-зонд строки (независимая деградация). Отсутствие строки =
+    # «не ходили»; status ∈ {ok,empty,error} — состоявшийся поход.
+    # ------------------------------------------------------------------ #
+    def put_wellness_probe(self, date: str, probe: str, status: str,
+                           payload: Any = None, detail: Optional[str] = None) -> None:
+        """Пишет результат ОДНОГО зонда за дату. payload сжимается только при наличии
+        (ok); empty/error → payload NULL. Upsert по (date,probe): повторный поход
+        перезаписывает строку с новым fetched_at (свежесть обновляется)."""
+        blob = _compress(payload) if (status == "ok" and payload is not None) else None
+        self.conn.execute(
+            "INSERT INTO wellness_cache(date,probe,status,detail,payload,fetched_at) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(date,probe) DO UPDATE SET "
+            "status=excluded.status, detail=excluded.detail, "
+            "payload=excluded.payload, fetched_at=excluded.fetched_at",
+            (date, probe, status, detail, blob, _iso_now()),
+        )
+        self.conn.commit()
+
+    def get_wellness_date(self, date: str) -> dict:
+        """Все зонды за дату из кэша. Возвращает {probe: {status, detail, payload,
+        fetched_at}} ТОЛЬКО для зондов, у которых строка ЕСТЬ. Отсутствующий зонд в
+        словарь не попадает (отсутствие строки = «не ходили» — читается вызывающим
+        как пропуск, не как empty). payload декомпрессится только при status=ok."""
+        rows = self.conn.execute(
+            "SELECT probe,status,detail,payload,fetched_at FROM wellness_cache "
+            "WHERE date=?", (date,),
+        ).fetchall()
+        out: dict = {}
+        for r in rows:
+            out[r["probe"]] = {
+                "status": r["status"],
+                "detail": r["detail"],
+                "payload": _decompress(r["payload"]) if r["payload"] is not None else None,
+                "fetched_at": r["fetched_at"],
+            }
+        return out
+
+    # ------------------------------------------------------------------ #
     # user_data — рукотворные метки (этап 7, §3.6). Намерение изолировано от
     # recompute; привязка (раствор) версионируема в user_lactate_resolved.
     # ------------------------------------------------------------------ #
@@ -917,7 +1017,7 @@ if __name__ == "__main__":
         st.meta_set("download_policy", "all")
 
         # --- этап 7: user_data (намерение) + user_lactate_resolved (раствор) ---
-        assert st.schema_version == 5, st.schema_version
+        assert st.schema_version == SCHEMA_VERSION, st.schema_version
         ver = "test-0.0.0"
         # намерение: at_time-метка (ok), user_ref без laps (deferred), заметка
         m1 = st.add_user_lactate(123, 6.0, at_time=1_700_000_150_000, source="llm")  # validation='ok'

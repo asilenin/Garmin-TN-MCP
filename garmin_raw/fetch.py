@@ -41,6 +41,16 @@ def _is_rate_limit(exc: Exception) -> bool:
         or any(c in s for c in ("500", "502", "503", "504"))
 
 
+def _first_method(client: Any, names: list[str]) -> Optional[Callable]:
+    """Первый существующий callable-метод клиента из кандидатов (устойчивость к
+    переименованиям методов между версиями garminconnect). None если ни одного."""
+    for n in names:
+        fn = getattr(client, n, None)
+        if callable(fn):
+            return fn
+    return None
+
+
 class Fetcher:
     """Троттлящий клиент. Все сетевые вызовы идут через _call().
 
@@ -127,6 +137,42 @@ class Fetcher:
 
     def get_full_activity(self, activity_id: int) -> dict:
         return self._call(self.client.get_activity, activity_id)
+
+    # ------------------------------------------------------------------ #
+    # wellness-зонды (этап 7.6). Пять каналов за дату, КАЖДЫЙ отдельным вызовом
+    # через _call (throttle/retry как у сырья) — чтобы per-зонд деградация жила:
+    # один упал → _call бросает → оркестратор (net_tools) пишет error, остальные
+    # идут. _first_method: имена методов garminconnect плавают между версиями →
+    # перебор кандидатов (замер probe_wellness подтвердил актуальные на живом стеке).
+    # PII: тело зондов персональных данных не несёт (probe-дамп), userProfileId
+    # только в URL — сюда не попадает (мы возвращаем тело, не URL).
+    # ------------------------------------------------------------------ #
+    WELLNESS_PROBES = {
+        "sleep":        (["get_sleep_data"], False),
+        "hrv":          (["get_hrv_data"], False),
+        "rhr":          (["get_rhr_day", "get_resting_heart_rate"], False),
+        "stress":       (["get_stress_data"], False),
+        "body_battery": (["get_body_battery"], True),   # зовётся (date, date)
+    }
+
+    def get_wellness_probe(self, probe: str, date: str) -> Any:
+        """Один wellness-зонд за дату. Возвращает сырое тело garminconnect (без
+        обработки — как сырьевые методы). Бросает при отсутствии метода в этой
+        версии garminconnect (ValueError) или при сетевом сбое (через _call).
+        Оркестратор ловит и классифицирует в status ok/empty/error."""
+        spec = self.WELLNESS_PROBES.get(probe)
+        if spec is None:
+            raise ValueError(f"неизвестный wellness-зонд: {probe}")
+        names, two_dates = spec
+        fn = _first_method(self.client, names)
+        if fn is None:
+            raise ValueError(
+                f"зонд {probe}: ни один метод {names} не найден в этой версии "
+                f"garminconnect"
+            )
+        if two_dates:
+            return self._call(fn, date, date)
+        return self._call(fn, date)
 
 
 # --------------------------------------------------------------------------- #
