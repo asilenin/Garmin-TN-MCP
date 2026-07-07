@@ -386,6 +386,67 @@ def delete_lactate(slug: str, mark_id: int) -> dict:
         return {"deleted": st.delete_user_mark(mark_id)}
 
 
+def enrich_activity(slug: str, activity_id: int) -> dict:
+    """Обогатить ОДНУ активность из УЖЕ СКАЧАННОГО сырья (streams в activity_raw).
+    CACHE-ONLY: сеть не трогает НИ НА КАКОМ пути (замок test_cache_only проверяет).
+
+    Случай (а) из ТЗ enrich-flow: raw есть → пересчёт из БД (чистый CPU). Случай (б)
+    (raw нет) НЕ обрабатывается здесь — возвращается структурированный отказ
+    {status: "no_raw"}, НЕ тихая деградация и НЕ авто-sync (это скрытое разветвление,
+    делающее тул неклассифицируемым по оси Q4; сетевой enrich — отдельный тул, стоп
+    до Q-8.1). LLM видит no_raw и решает (сетевой путь / sync), порога в коде нет.
+
+    Предикат "raw есть" — ЕДИНЫЙ st.has_raw(id,'streams') (тот же, что агрегирует
+    garmin_enrich_estimate — один источник истины, не два разъезжающихся определения).
+
+    Возврат:
+      {status: "enriched", activity_id}          — обогащено, лежит в activity_enriched;
+      {status: "already", activity_id}           — уже обогащено текущей версией;
+      {status: "no_raw", activity_id, hint}      — streams не в кэше, cache-only enrich
+                                                    невозможен (случай (б), не мой);
+      {status: "not_found", activity_id}         — активности нет в каталоге;
+      {status: "error", activity_id, detail}     — сбой фазы обогатить-и-записать:
+          движок на структурно-нечитаемом сырье, ЛИБО сбой put_enriched/backfill
+          (диск/лок). Намеренно НЕСПЕЦИФИЧЕН (широкий except — по дизайну, не лень):
+          LLM получает факт "не получилось", реакция одна для всех причин (повтор
+          может помочь или нет), диагностировать причину по detail НЕ должен — detail
+          для человека в логах, не для ветвления. Редок на здоровом кэше, но держит
+          контракт "тул возвращает структуру, не бросает" (как blocked_by_auth wellness).
+    """
+    from enrich import ALGO_VERSION, enrich_activity as _enrich_engine  # numpy тяжёлый
+
+    with Store(profiles.resolve(slug).db_path) as st:
+        if st.conn.execute("SELECT 1 FROM activities WHERE activity_id=?",
+                            (activity_id,)).fetchone() is None:
+            return {"status": "not_found", "activity_id": activity_id}
+        if st.has_enriched(activity_id, ALGO_VERSION):
+            return {"status": "already", "activity_id": activity_id}
+        # ЕДИНЫЙ предикат raw-есть — тот же, что в estimate-агрегате.
+        if not st.has_raw(activity_id, "streams"):
+            return {
+                "status": "no_raw",
+                "activity_id": activity_id,
+                "hint": "streams не в кэше — cache-only обогащение невозможно; "
+                        "нужен сетевой путь (fetch streams) или sync",
+            }
+        # raw есть → пересчёт БЕЗ сети (сырьё с диска)
+        stream = st.get_raw(activity_id, "streams")
+        laps = st.get_raw(activity_id, "laps")
+        craw = st.get_raw(activity_id, "comment")
+        comment = craw.get("lactate_mmol", []) if isinstance(craw, dict) else []
+        try:
+            enriched = _enrich_engine(
+                stream, laps=laps,
+                lactate_watch_points=[], lactate_comment_values=comment,
+            )
+            st.put_enriched(activity_id, enriched)
+            st.backfill_device_model(activity_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "error", "activity_id": activity_id,
+                    "detail": f"{type(exc).__name__}: {exc}"}
+        return {"status": "enriched", "activity_id": activity_id}
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
