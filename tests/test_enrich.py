@@ -64,9 +64,47 @@ def test_predicate_single_source() -> None:
     print(f"  predicate: streams-строка есть → покинул no_raw (status={r['status']}) OK")
 
 
+def test_predicate_consistency() -> None:
+    """СТРАЖ согласованности has_raw ↔ count_enrich_pending (Q8/Q9): один критерий в
+    двух формах (точечная / агрегатная) не должен разъехаться. Проверка ПОВЕДЕНИЯ, не
+    текста SQL (текстовая константа не ловит структурный разъезд — ср. upsert Q2).
+    Две ветки в ОБЕ стороны — missing_raw создаётся ПОЛНЫМ отсутствием строки, не
+    пустым put_raw (это разные состояния: нет строки vs строка с мусором; has_raw
+    проверяет наличие строки)."""
+    from enrich import ALGO_VERSION
+    with Store(prof.db_path) as st:
+        # чистое состояние для замера: своя дата, свои id
+        st.conn.execute("DELETE FROM activities WHERE activity_id IN (7001,7002)")
+        st.conn.execute("DELETE FROM activity_raw WHERE activity_id IN (7001,7002)")
+        st.conn.execute("INSERT INTO activities(activity_id,date,sport) "
+                        "VALUES(7001,'2099-01-01','running'),(7002,'2099-01-01','running')")
+        # 7001: raw ЕСТЬ (has_raw_no_enrich); 7002: raw НЕТ вовсе (missing_raw)
+        st.put_raw(7001, "streams", {"x": 1})
+        st.conn.commit()
+        # точечный предикат
+        assert st.has_raw(7001, "streams") is True
+        assert st.has_raw(7002, "streams") is False
+        # агрегат на том же окне
+        c = st.count_enrich_pending(ALGO_VERSION, start="2099-01-01", end="2099-01-01")
+    assert c["has_raw_no_enrich"] == 1, c   # 7001: has_raw True → сюда
+    assert c["missing_raw"] == 1, c         # 7002: has_raw False, нет enrich → сюда
+    print("  consistency: has_raw ↔ count_enrich_pending согласны (raw-есть/raw-нет) OK")
+
+
+def test_estimate_cache_only_shape() -> None:
+    """enrich_estimate возвращает ДВА count, НЕ время (асимметрия намеренна, Q9)."""
+    r = tools.enrich_estimate(SLUG)
+    assert set(r) == {"count_has_raw_no_enrich", "count_missing_raw"}, r
+    assert "estimated_hours_best_case" not in r, "время просочилось в cache-only estimate (Q9)"
+    assert isinstance(r["count_has_raw_no_enrich"], int)
+    print(f"  estimate: два count без времени {r} OK")
+
+
 if __name__ == "__main__":
     test_not_found()
     test_no_raw()
     test_predicate_single_source()
+    test_predicate_consistency()
+    test_estimate_cache_only_shape()
     print("ГЕРМЕТИЧНЫЕ тесты enrich_activity — ЗЕЛЁНЫЕ "
           "(enriched/already/error — живой тест у владельца)")

@@ -493,6 +493,50 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def count_enrich_pending(self, algo_version: str, *, start: Optional[str] = None,
+                             end: Optional[str] = None,
+                             sport: Optional[str] = None) -> dict:
+        """Два count для garmin_enrich_estimate, ОДНИМ проходом (не N×has_raw построчно):
+          missing_raw       — активности БЕЗ строки streams (has_raw=false) и без enrich
+                              → нужен сетевой fetch (случай (б), сетевой enrich, до Q-8.1);
+          has_raw_no_enrich — строка streams ЕСТЬ, но нет enrich текущей версии
+                              → cache-only точечный enrich_activity (случай (а)).
+
+        Критерий ТОТ ЖЕ, что у has_raw/has_enriched — «наличие СТРОКИ», не валидность
+        payload (битый streams при наличии строки → has_raw_no_enrich, тул вернёт error
+        при пересчёте, НЕ no_raw — это верно по предикату). Согласованность с
+        has_raw/has_enriched проверяется стражем test_enrich (поведение, не текст SQL —
+        текстовая константа не ловит структурный разъезд, ср. upsert INSERT/UPDATE Q2).
+        """
+        clauses, params = ["1=1"], []
+        if start:
+            clauses.append("a.date >= ?"); params.append(start)
+        if end:
+            clauses.append("a.date <= ?"); params.append(end)
+        if sport:
+            clauses.append("a.sport = ?"); params.append(sport)
+        where = " AND ".join(clauses)
+        # LEFT JOIN на тех же условиях, что has_raw (kind='streams') и has_enriched
+        # (algo_version). NULL справа = отсутствие строки — та же семантика, что предикаты.
+        sql = f"""
+            SELECT
+              SUM(CASE WHEN r.activity_id IS NULL AND e.activity_id IS NULL
+                       THEN 1 ELSE 0 END) AS missing_raw,
+              SUM(CASE WHEN r.activity_id IS NOT NULL AND e.activity_id IS NULL
+                       THEN 1 ELSE 0 END) AS has_raw_no_enrich
+            FROM activities a
+            LEFT JOIN activity_raw r
+              ON r.activity_id = a.activity_id AND r.kind = 'streams'
+            LEFT JOIN activity_enriched e
+              ON e.activity_id = a.activity_id AND e.algo_version = ?
+            WHERE {where}
+        """
+        row = self.conn.execute(sql, [algo_version, *params]).fetchone()
+        return {
+            "missing_raw": row["missing_raw"] or 0,
+            "has_raw_no_enrich": row["has_raw_no_enrich"] or 0,
+        }
+
     # ------------------------------------------------------------------ #
     # Обогащение activity_enriched (версионировано по algo_version)
     # ------------------------------------------------------------------ #

@@ -44,6 +44,7 @@ TOOL_ARGS = {
     "add_note":             ((SLUG, 999999, "x"), {}),
     "delete_lactate":       ((SLUG, 999999), {}),
     "enrich_activity":      ((SLUG, 999999), {}),
+    "enrich_estimate":      ((SLUG,), {}),
 }
 
 

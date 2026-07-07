@@ -447,6 +447,43 @@ def enrich_activity(slug: str, activity_id: int) -> dict:
         return {"status": "enriched", "activity_id": activity_id}
 
 
+def enrich_estimate(slug: str, *, start: Optional[str] = None,
+                    end: Optional[str] = None, sport: Optional[str] = None) -> dict:
+    """Оценка объёма недостающего обогащения. CACHE-ONLY read (каталог+raw+enriched,
+    сети нет — замок test_cache_only). LLM видит факты, решает «точечно/пакетно/терминал».
+
+    Возврат — ДВА COUNT, БЕЗ времени:
+      count_has_raw_no_enrich — streams в кэше, enrich нет → cache-only точечный
+                                enrich_activity (случай (а), домен ЭТОГО тула);
+      count_missing_raw       — streams НЕТ → нужен сетевой fetch (случай (б)).
+
+    ВРЕМЯ НЕ ДАЁТСЯ НИ ДЛЯ ОДНОЙ ЧАСТИ — и это НЕ недоделка (обоснование QA Q9):
+      • cache-only часть: CPU-пересчёт пренебрежим; совокупность N точечных вызовов
+        доминируется MCP round-trip — НЕ домен коннектора (как терпение/поведение сети).
+        count_has_raw_no_enrich — количество единиц работы, не время; LLM решает по числу
+        и своему знанию транспорта.
+      • сетевая часть: время сетевого fetch (× throttle-pace) — домен СЕТЕВОГО estimate
+        (класс net_tools, знает pace легально), НЕ этого cache-only тула. tools.py не
+        импортирует сетевой слой (замок). ПОКА сетевого enrich-estimate НЕТ (он до Q-8.1)
+        — count_missing_raw это факт «столько потребуют сети», без доступной оценки времени.
+      НЕ добавлять estimated_hours/seconds сюда «для полноты» — воспроизведёт протечку
+      домена (cache-only тул рассуждает о сети), которую замок здесь и поймал.
+
+    ЕДИНЫЙ ПРЕДИКАТ: st.count_enrich_pending — тот же критерий, что has_raw/has_enriched
+    у enrich_activity (Q8). Будущий сетевой estimate ОБЯЗАН агрегировать ТОТ ЖЕ
+    count_enrich_pending для count_missing_raw, не свой скан (иначе разъезд, как has_raw).
+    Согласованность — страж test_enrich.
+    """
+    from enrich import ALGO_VERSION  # только константа версии, без numpy/сети
+
+    with Store(profiles.resolve(slug).db_path) as st:
+        counts = st.count_enrich_pending(ALGO_VERSION, start=start, end=end, sport=sport)
+    return {
+        "count_has_raw_no_enrich": counts["has_raw_no_enrich"],
+        "count_missing_raw": counts["missing_raw"],
+    }
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
