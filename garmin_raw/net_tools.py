@@ -137,3 +137,39 @@ def garmin_wellness(slug: str, date: str, *, refresh: bool = False) -> dict:
     if login_error is not None:
         out["login_error"] = login_error   # сообщение reauth; причинность — в blocked_by_auth
     return out
+
+
+def garmin_sync_catalog(slug: str, start: str, end: str) -> dict:
+    """Инкрементальное наполнение каталога за ЯВНЫЙ диапазон [start, end] (ISO).
+    СЕТЕВОЙ WRITE (net_tools, не cache-only): цель — сходить в Garmin и дописать
+    каталог, сеть трогается всегда (в отличие от wellness cache-hit).
+
+    Диапазон ОБЯЗАТЕЛЕН, без дефолта (контракт Q5): скрытый дефолт «от last_sync до
+    today» молча вырос бы после простоя. LLM формулирует диапазон сам — типично «от
+    cache_status.garmin_range[1] (max дата каталога) до сегодня» для инкремента
+    («докачай свежее»). Источник «докуда есть» — наблюдаемая max-дата каталога, НЕ
+    записанный last_sync_window (наблюдаемое состояние вернее чекпойнта; last_sync_window
+    — отдельная задача для CLI-архива, не для этого тула).
+
+    Тонкая обёртка над sync_catalog(start_date, end_date) — тот же обход окон/retry/
+    останов, что CLI-путь, только явные границы. Идемпотентно (upsert), resumable
+    (per-window commit): повторный вызов того же диапазона дёшев (окна перекрываются).
+
+    Возврат (факт результата для LLM, не вердикт):
+      {windows, activities_upserted, range: [lo, hi], stopped_early, stop_reason,
+       elapsed_s} — сколько окон обошли, сколько активностей записали, новый диапазон
+      каталога после синка. Ошибка сети/login — пробрасывается (тул честно падает,
+      не маскирует: в отличие от wellness, здесь нет частичного кэша для спасения).
+    """
+    from sync import sync_catalog
+
+    prof = profiles.resolve(slug)  # noqa: F841  (валидация slug + единый путь резолва)
+    rep = sync_catalog(slug, start_date=start, end_date=end)
+    return {
+        "windows": rep.windows,
+        "activities_upserted": rep.activities_upserted,
+        "range": [rep.range_start, rep.range_end],
+        "stopped_early": rep.stopped_early,
+        "stop_reason": rep.stop_reason,
+        "elapsed_s": round(rep.elapsed_s, 2),
+    }

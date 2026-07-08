@@ -111,14 +111,35 @@ def _fetch_window_with_retry(
             attempt += 1
 
 
-def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS) -> SyncReport:
-    """Наполняет каталог профиля окнами по 3 месяца. Идемпотентно, resumable."""
+def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
+                 start_date: Optional[str] = None,
+                 end_date: Optional[str] = None) -> SyncReport:
+    """Наполняет каталог профиля окнами по 3 месяца. Идемпотентно, resumable.
+
+    Границы — ДВА взаимоисключающих пути:
+      • history_years (дефолт) — CLI-архивный путь: [1 янв (today.year−N), today].
+        Старый код, продиагностирован; при явных датах НЕ используется.
+      • start_date/end_date (ISO 'YYYY-MM-DD') — явный диапазон для MCP-инкремента
+        (garmin_sync_catalog): «докачай от X до Y». Обязателен обязательным диапазоном
+        по контракту Q5 (без скрытого дефолта-в-сеть). Оба или ни одного.
+    Обход окон (_iter_windows), retry, останов по пустым — ОБЩИЕ для обоих путей,
+    не переписаны: меняется ТОЛЬКО вычисление границ."""
     prof = profiles.resolve(slug)
     t0 = time.time()
     rep = SyncReport()
 
-    end = date.today()
-    start = date(end.year - history_years, 1, 1)
+    if start_date is not None or end_date is not None:
+        # явный диапазон (MCP-инкремент): оба обязательны вместе
+        if start_date is None or end_date is None:
+            raise ValueError("start_date и end_date задаются только вместе")
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        if start > end:
+            raise ValueError(f"start_date {start_date} позже end_date {end_date}")
+    else:
+        # CLI-архивный путь (старая формула, нетронута)
+        end = date.today()
+        start = date(end.year - history_years, 1, 1)
 
     fetcher = Fetcher(tokenstore=prof.tokens_dir)
     empty_streak = 0
