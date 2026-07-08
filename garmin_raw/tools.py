@@ -58,10 +58,27 @@ def query_index(slug: str, *, limit: int = 50, order: str = "date_desc",
 
     Пример: query_index('anton', date_from='2026-01-01', sport='running',
                          max_hr_min=180, limit=20)
+    sport_class='run' — все беговые typeKey разом (running+trail+treadmill+track+indoor),
+    чтобы «сколько пробежек» не зависело от памяти о всех типах (RUN-CLASS-PREDICATE).
+    sport='running' — по ОДНОМУ typeKey (уже; для точной фильтрации конкретного типа).
     Неизвестные/нефильтруемые ключи игнорируются (обманчивые поля не фильтруются).
     """
     clauses, params = [], []
     ignored = []
+    # sport_class — спец-фильтр (разворот класса в sport IN (...) через taxonomy):
+    # не влезает в _FILTERABLE-шаблон «поле = ?» (один param), т.к. даёт СПИСОК typeKey.
+    # Решает RUN-CLASS-PREDICATE: «сколько пробежек» = union всех *_running, не забытый
+    # вручную набор (недобор mila: sport=running дал 1347 из 1648, пропустив 257 treadmill).
+    sport_class = filters.pop("sport_class", None)
+    if sport_class is not None:
+        from sport_taxonomy import type_keys_for_class
+        keys = type_keys_for_class(sport_class)
+        if keys:
+            placeholders = ",".join("?" * len(keys))
+            clauses.append(f"sport IN ({placeholders})")
+            params.extend(sorted(keys))   # sorted — детерминизм плейсхолдеров
+        else:
+            ignored.append("sport_class")  # неизвестный класс — честно не фильтруем
     for key, val in filters.items():
         if key not in _FILTERABLE:
             ignored.append(key)

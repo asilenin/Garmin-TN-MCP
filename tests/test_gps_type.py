@@ -10,7 +10,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "garmin_raw"))
 os.environ["GARMIN_TN_HOME"] = tempfile.mkdtemp()
 
-from enrich import _gps_type_from_sport, _GPS_TYPE_BY_SPORT, ALGO_VERSION  # noqa: E402
+from enrich import _gps_type_from_sport, ALGO_VERSION  # noqa: E402
+from sport_taxonomy import GPS_TYPE_BY_SPORT as _GPS_TYPE_BY_SPORT  # noqa: E402
 
 
 def test_mapping_five_values() -> None:

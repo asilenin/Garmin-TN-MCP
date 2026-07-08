@@ -210,28 +210,12 @@ K_GCT_BALANCE = "directGroundContactBalanceLeft"
 _STRYD_APPID = "18fb2cf0-1a4b-430d-ad66-988c847421f4"
 
 # gps_type (T7.6-2b): GPS-СРЕДА из декларации пользователя (sport/typeKey Garmin).
-# ДОВЕРЯЕМ РАЗМЕТКЕ — механический перевод словаря номенклатуры, НЕ инференс из данных
-# (темп/lap_count не используются: вывод среды из сигнала заменил бы декларацию догадкой).
-# Пять значений; indoor ОТДЕЛЬНО от treadmill (не схлопывать): дорожка несёт бегуна
-# belt-assist, пол — нет → систематически разные GCT/vert-ratio (МЕТОД §5.4 межгодовое
-# сравнение). Схлопывание = невосстановимая потеря (typeKey свёрнут при записи, recompute
-# не вернёт). indoor ('без GPS, не дорожка') ≠ None ('typeKey не распознан').
-_GPS_TYPE_BY_SPORT = {
-    "running": "outdoor",
-    "trail_running": "outdoor",
-    "treadmill_running": "treadmill",
-    "track_running": "track",       # круговой GPS с систематической погрешностью дистанции
-    "indoor_running": "indoor",
-}
-
-
-def _gps_type_from_sport(sport: Optional[str]) -> Optional[str]:
-    """typeKey → gps_type по словарю декларации. Неизвестный/None typeKey → None
-    ('не распознан', не гадаем — расширяемо новым typeKey). Механический перевод, не
-    суждение (пороги отсутствуют)."""
-    if sport is None:
-        return None
-    return _GPS_TYPE_BY_SPORT.get(sport)   # неизвестный → None
+# Словарь номенклатуры вынесен в sport_taxonomy.py (единый источник для gps_type И
+# sport_class И будущих производных — «забыл typeKey в одном словаре» структурно
+# невозможно, все производные от одной таблицы). Демаркация та же: механический перевод
+# декларации, НЕ инференс из данных; indoor ≠ treadmill (belt-assist vs пол, §5.4);
+# неизвестный typeKey → None (расширяемо новой строкой таблицы, не гадаем).
+from sport_taxonomy import gps_type_from_sport as _gps_type_from_sport  # noqa: E402
 
 
 def _index_map(stream: dict) -> dict[str, int]:
