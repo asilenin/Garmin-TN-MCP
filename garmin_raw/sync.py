@@ -94,6 +94,11 @@ def _fetch_window_with_retry(
         try:
             return fetcher.list_activities(w_start, w_end)
         except (RateLimited, Exception) as exc:  # noqa: BLE001
+            # SYNC-RETRY-AUTH: login-сбой (протухли токены между окнами) НЕ ретраим —
+            # не транзиентный. Признак — текст _connect (fetch.py:88). Пробрасываем сразу.
+            if "Не удалось войти" in str(exc):
+                raise RuntimeError(f"окно {w_start}..{w_end}: login-сбой в обходе "
+                                   f"(токены протухли?), не ретраим. {exc}") from exc
             # fetch.py уже отработал короткий backoff на мелочь и сдался —
             # значит это «Garmin прилёг». Ждём по-крупному.
             step = WINDOW_RETRY_STEPS_S[min(attempt, len(WINDOW_RETRY_STEPS_S) - 1)]
@@ -142,6 +147,18 @@ def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
         start = date(end.year - history_years, 1, 1)
 
     fetcher = Fetcher(tokenstore=prof.tokens_dir)
+    # SYNC-RETRY-AUTH: login ЯВНО до цикла окон (симметрично wellness login-фазе).
+    # login-сбой (протухшие токены) — НЕ транзиентный: ретраить бессмысленно (токены
+    # не «войдут обратно» за паузу). Раньше он тонул в per-window retry → 6-мин
+    # зависание. Теперь падает СРАЗУ, вне retry. Успешный login кэшируется
+    # (fetcher.client), повторный доступ в окнах не логинится снова — не лишний вызов.
+    try:
+        _ = fetcher.client   # ленивый login происходит здесь; сбой → RuntimeError наружу
+    except RuntimeError as exc:
+        # быстрый auth-отказ вместо зависания: не ретраим login
+        raise RuntimeError(
+            f"sync прерван: login не удался (токены?). {exc}"
+        ) from exc
     empty_streak = 0
     with Store(prof.db_path) as st:
         for w_start, w_end in _iter_windows(start, end, WINDOW_MONTHS):
