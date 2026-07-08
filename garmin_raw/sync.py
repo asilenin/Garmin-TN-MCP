@@ -118,7 +118,8 @@ def _fetch_window_with_retry(
 
 def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
                  start_date: Optional[str] = None,
-                 end_date: Optional[str] = None) -> SyncReport:
+                 end_date: Optional[str] = None,
+                 dry_run: bool = False) -> SyncReport:
     """Наполняет каталог профиля окнами по 3 месяца. Идемпотентно, resumable.
 
     Границы — ДВА взаимоисключающих пути:
@@ -128,7 +129,20 @@ def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
         (garmin_sync_catalog): «докачай от X до Y». Обязателен обязательным диапазоном
         по контракту Q5 (без скрытого дефолта-в-сеть). Оба или ни одного.
     Обход окон (_iter_windows), retry, останов по пустым — ОБЩИЕ для обоих путей,
-    не переписаны: меняется ТОЛЬКО вычисление границ."""
+    не переписаны: меняется ТОЛЬКО вычисление границ.
+
+    dry_run — ПРИВАТНЫЙ флаг для garmin_sync_estimate (обходит окна через list_activities,
+    считает объём, но НЕ мутирует состояние). Пропускает ВСЮ запись: upsert И все meta_set
+    (last_sync/last_sync_window/range/policy) — иначе estimate молча продвинул бы чекпойнт
+    синка, хотя каталог не тронут (тихий рассинхрон meta↔каталог). count под dry_run =
+    len(rows) (сколько Garmin отдал бы), не результат upsert.
+      КРИТЕРИЙ безопасности флага (в отличие от Q8-режима, отвергнутого): dry_run НЕ меняет
+      классификацию ПУБЛИЧНОГО имени — sync_catalog остаётся write, sync_estimate остаётся
+      read, каждое имя классифицировано однозначно на поверхности; dry_run невидим снаружи,
+      netguard-класс обёрток от него не зависит. Q8-флаг был опасен именно тем, что менял
+      класс ОДНОГО публичного имени (сеть/не-сеть плавала). Флаг безопасен как приватная
+      деталь, вызываемая из двух публичных обёрток с фиксированной семантикой; опасен когда
+      создаёт двусмысленность классификации на публичной поверхности."""
     prof = profiles.resolve(slug)
     t0 = time.time()
     rep = SyncReport()
@@ -171,13 +185,19 @@ def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
                 break
 
             rows = [activity_row_from_summary(a) for a in acts if a]
-            n = st.upsert_activities(rows) if rows else 0
+            # count объёма: под dry_run — сколько Garmin ОТДАЛ БЫ (len), не результат upsert
+            if dry_run:
+                n = len(rows)
+            else:
+                n = st.upsert_activities(rows) if rows else 0
             rep.windows += 1
             rep.activities_upserted += n
             rep.window_log.append(f"  окно {ws}..{we}: +{n}")
-            # чекпойнт прогресса в meta (для наблюдаемости; данные уже в БД)
-            st.meta_set("last_sync", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-            st.meta_set("last_sync_window", we)
+            # чекпойнт прогресса — ТОЛЬКО при реальном синке (dry_run не продвигает meta,
+            # иначе тихий рассинхрон: meta говорит «синкали», каталог не тронут)
+            if not dry_run:
+                st.meta_set("last_sync", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                st.meta_set("last_sync_window", we)
 
             # останов по серии пустых окон = достигли начала архива (см. EMPTY_WINDOWS_STOP).
             # Длинная пауза в тренировках (сезон-два) НЕ оборвёт: порог = 2 года пустоты.
@@ -191,12 +211,13 @@ def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
             else:
                 empty_streak = 0
 
-        lo, hi = st.activity_date_range()
+        lo, hi = st.activity_date_range()   # read — для отчёта (range каталога КАК ЕСТЬ)
         rep.range_start, rep.range_end = lo, hi
-        st.meta_set("garmin_range_start", lo or "")
-        st.meta_set("garmin_range_end", hi or "")
-        if st.meta_get("download_policy") is None:
-            st.meta_set("download_policy", "all")
+        if not dry_run:
+            st.meta_set("garmin_range_start", lo or "")
+            st.meta_set("garmin_range_end", hi or "")
+            if st.meta_get("download_policy") is None:
+                st.meta_set("download_policy", "all")
 
     rep.elapsed_s = time.time() - t0
     return rep

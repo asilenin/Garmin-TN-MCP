@@ -149,6 +149,16 @@ def garmin_sync_catalog(start: str, end: str) -> dict:
 
 
 @mcp.tool()
+def garmin_sync_estimate(start: str, end: str) -> dict:
+    """Оценка объёма/времени синка каталога за [start, end] ДО закачки. СЕТЕВОЙ read
+    (ходит в Garmin list_activities — сколько активностей за диапазон; НЕ мутирует
+    каталог). Возврат: count (активностей отдаст), windows, estimated_hours_best_case
+    (по окнам, не по count), catalog_range. Зови перед garmin_sync_catalog, если не
+    уверен в объёме; реши «сейчас/CLI» по факту. Диапазон обязателен."""
+    return net_tools.garmin_sync_estimate(_slug(), start, end)
+
+
+@mcp.tool()
 def garmin_enrich_fetch(activity_id: int) -> dict:
     """Скачать сырьё ОДНОЙ активности (streams+laps+watch-лактат) из Garmin и обогатить.
     СЕТЕВОЙ write, точечный. Замыкает цепочку sync→streams→enrich: для активностей, что
@@ -214,7 +224,8 @@ if __name__ == "__main__":
         for fn in (garmin_compact, garmin_full, garmin_query, garmin_aggregates,
                    garmin_status, garmin_add_lactate, garmin_add_note, garmin_delete_mark,
                    garmin_wellness, garmin_enrich_activity, garmin_enrich_estimate,
-                   garmin_sync_catalog, garmin_enrich_fetch, garmin_enrich_fetch_estimate):
+                   garmin_sync_catalog, garmin_sync_estimate, garmin_enrich_fetch,
+                   garmin_enrich_fetch_estimate):
             assert "slug" not in inspect.signature(fn).parameters, f"slug в схеме {fn.__name__}"
         print("1 slug НЕ в сигнатуре тулов ✓ (вкл. 7.6: wellness/enrich/sync)")
 

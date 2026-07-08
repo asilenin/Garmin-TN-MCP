@@ -309,3 +309,51 @@ def garmin_enrich_fetch_estimate(slug: str, *, start: Optional[str] = None,
         "note": "best_case: без retry/backoff (нижняя граница). Большой count → CLI "
                 "enrich_batch, не N MCP-вызовов.",
     }
+
+
+def garmin_sync_estimate(slug: str, start: str, end: str) -> dict:
+    """Оценка объёма/времени синка каталога за диапазон [start, end] ДО тяжёлой закачки
+    (контракт Q5). СЕТЕВОЙ read (в отличие от garmin_enrich_fetch_estimate — тот домен-
+    знания из кэша, зелёный под forbid_network; ЭТОТ ходит в сеть — list_activities за
+    окна — чтобы узнать, сколько Garmin отдаст за диапазон, которого каталог ещё не видел;
+    КРАСНЫЙ под forbid_network).
+
+    Идемпотентный: обходит те же окна, что garmin_sync_catalog (через sync_catalog(
+    dry_run=True) — тот же login-fail-fast, retry, останов, БЕЗ мутации каталога/meta).
+    Ценность — факт объёма БЕЗ мутации, не экономия сети (сетевая цена ~= синку: оба
+    обходят окна; разница — запись в БД). LLM решает «делать сейчас / CLI» по факту, не
+    по зашитому порогу.
+
+    Возврат: {count, windows, estimated_hours_best_case, catalog_range}:
+      count      — сколько активностей Garmin отдал за диапазон (факт объёма);
+      windows    — число окон обхода (ЕДИНИЦА времени синка: throttle между окнами, НЕ
+                   между активностями — время растёт с окнами, не с count);
+      estimated_hours_best_case — windows × pace / 3600 (best_case: без retry/backoff,
+                   нижняя граница; расхождение с реальным — ожидаемое свойство _best_case,
+                   не дефект, как в sync/enrich estimate);
+      catalog_range — [lo, hi] каталога КАК ЕСТЬ сейчас (dry_run не менял) — для контекста,
+                   не «что будет после».
+    Диапазон обязателен (Q5, без дефолта). count время — РАЗНЫЕ единицы: count=активности
+    (объём), время=окна (стоимость обхода). Не путать (единица sync — окна, не активности,
+    в отличие от enrich где единица — активность).
+    """
+    from sync import sync_catalog, _iter_windows, WINDOW_MONTHS
+    from fetch import DEFAULT_PACE_S
+    from datetime import date as _date
+
+    # dry_run: обход окон через тот же sync_catalog (login-fix/retry/останов наследуются),
+    # без мутации каталога/meta. count = сколько Garmin отдал бы.
+    rep = sync_catalog(slug, start_date=start, end_date=end, dry_run=True)
+
+    # время — по ОКНАМ (единица стоимости синка), не по count. windows берём из отчёта
+    # (фактически обойдённые, с учётом раннего останова), pace — throttle между окнами.
+    windows = rep.windows
+    est_hours = windows * DEFAULT_PACE_S / 3600.0
+    return {
+        "count": rep.activities_upserted,   # под dry_run = сколько отдал бы (len rows)
+        "windows": windows,
+        "estimated_hours_best_case": round(est_hours, 4),
+        "catalog_range": [rep.range_start, rep.range_end],
+        "note": "count=активности (объём), время=windows×pace (стоимость обхода — разные "
+                "единицы). best_case без retry. Большой объём → CLI, реши по факту.",
+    }
