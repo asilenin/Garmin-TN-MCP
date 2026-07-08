@@ -14,6 +14,19 @@ forbid_network).
 Классификация по оси Q4: garmin_wellness — сетевой READ (ходит в сеть, но пишет только
 в кэш-как-след-похода, не пользовательские данные; цель вызова — вернуть данные СЕЙЧАС,
 не «оставить raw навсегда»). Симметрия с garmin_sync_estimate.
+
+ВАЖНО — модуль сетевого ДОМЕНА, НЕ «все функции ходят в сеть». Импорт Fetcher/pace =
+grep-признак сетевого КЛАССА модуля, но внутри есть ТРИ рода функций:
+  • сетевое ДЕЙСТВИЕ (garmin_wellness, garmin_sync_catalog, garmin_enrich_fetch) —
+    реально трогают сокет, под forbid_network КРАСНЫЕ (netguard ловит);
+  • сетевой ДОМЕН ЗНАНИЯ (garmin_enrich_fetch_estimate) — владеет throttle-pace
+    (сетевое знание, читать legal только здесь), но сеть НЕ трогает (count из кэша ×
+    pace-константа); под forbid_network ЗЕЛЁНЫЙ. Живёт здесь по домену знания, не по
+    факту вызова — иначе pace пришлось бы тащить в cache-only tools.py (протечка, Q9).
+Не добавлять функцию сюда «по аналогии, домен же тот же», не проверив, к какому роду
+она относится — иначе «net_tools = сетевой» размоется в «net_tools = разное про сеть».
+Тест-контраст (test_enrich_fetch): действие пробивает forbid_network, домен-знания
+проходит — граница видима, не только задекларирована.
 """
 from __future__ import annotations
 
@@ -172,4 +185,123 @@ def garmin_sync_catalog(slug: str, start: str, end: str) -> dict:
         "stopped_early": rep.stopped_early,
         "stop_reason": rep.stop_reason,
         "elapsed_s": round(rep.elapsed_s, 2),
+    }
+
+
+def garmin_enrich_fetch(slug: str, activity_id: int) -> dict:
+    """Скачать сырьё ОДНОЙ активности из сети и обогатить. СЕТЕВОЙ WRITE (точечный).
+
+    Замыкает цепочку sync→streams→enrich: catalog-sync даёт summary, этот тул тянет
+    streams+laps+watch-лактат из Garmin и обогащает. Для случая (б) Q8 (raw нет в кэше).
+
+    ТОЧЕЧНЫЙ (один activity_id) — для малого N. Оценку объёма/времени для множества
+    даёт garmin_enrich_fetch_estimate (сетевой домен); большой N дорог (N×throttle) →
+    CLI enrich_batch, не N MCP-вызовов. Реши по count_missing_raw (garmin_enrich_estimate)
+    + времени (garmin_enrich_fetch_estimate), НЕ вслепую.
+
+    Watch-лактат передаётся СЫРЫМ в enrich_activity (единая точка входа — оба
+    потребителя, enrich_batch и этот тул, наследуют обработку через движок, без разъезда).
+    ВНИМАНИЕ: дедупликация полок watch-лактата НЕ реализована (backlog LACTATE-PLATEAU-SEG,
+    ждёт реальных образцов) → при наличии замеров count_watch завышен (сырые точки полки,
+    не отметки). Пока замеров нет (полки пустые, value≤0 отфильтрован) — точек нет, корректно.
+
+    Возврат: {status, activity_id, [raw_fetched, enriched]} —
+      enriched   — скачано+обогащено (streams не было, докачали, enrich прошёл);
+      already    — уже обогащено текущей версией (сеть не трогали);
+      not_found  — активности нет в каталоге;
+      error      — сбой скачивания/обогащения (detail; login-сбой — тоже error здесь,
+                   в отличие от wellness: точечный тул, частичного кэша для спасения нет).
+    """
+    from enrich import ALGO_VERSION, enrich_activity as _enrich_engine
+    from backend import GarminSource
+
+    prof = profiles.resolve(slug)
+    with Store(prof.db_path) as st:
+        # not_found: активности нет в каталоге
+        if st.conn.execute("SELECT 1 FROM activities WHERE activity_id=?",
+                            (activity_id,)).fetchone() is None:
+            return {"status": "not_found", "activity_id": activity_id}
+        # already: обогащено текущей версией — сеть не трогаем (cache-hit до Fetcher)
+        if st.has_enriched(activity_id, ALGO_VERSION):
+            return {"status": "already", "activity_id": activity_id}
+
+    # сеть: Fetcher (streams/laps) + GarminSource (watch-лактат/comment)
+    try:
+        f = Fetcher(tokenstore=prof.tokens_dir)
+        gs = GarminSource(tokenstore=str(prof.tokens_dir))
+        with Store(prof.db_path) as st:
+            # streams — обязательное сырьё; качаем и СРАЗУ сохраняем
+            stream = st.get_raw(activity_id, "streams")
+            raw_fetched = False
+            if stream is None:
+                stream = f.get_streams(activity_id)
+                st.put_raw(activity_id, "streams", stream)
+                raw_fetched = True
+                if not st.has_raw(activity_id, "laps"):
+                    try:
+                        st.put_raw(activity_id, "laps", f.get_laps(activity_id))
+                    except Exception:  # noqa: BLE001
+                        pass
+            # watch-лактат + comment (оба необязательны; value≤0 фильтруется в backend)
+            lact = []
+            try:
+                lact = gs.get_activity_lactate(activity_id).get("points", [])
+            except Exception:  # noqa: BLE001
+                lact = []
+            comment = []
+            try:
+                craw = gs.get_activity_comment(activity_id)
+                comment = craw.get("lactate_mmol", [])
+                st.put_raw(activity_id, "comment", craw)
+            except Exception:  # noqa: BLE001
+                comment = []
+            laps = st.get_raw(activity_id, "laps")
+            # обогащение — ЕДИНАЯ точка входа: сырой watch-лактат в движок, без шортката
+            enriched = _enrich_engine(
+                stream, laps=laps,
+                lactate_watch_points=lact, lactate_comment_values=comment,
+            )
+            st.put_enriched(activity_id, enriched)
+            st.backfill_device_model(activity_id)
+        return {"status": "enriched", "activity_id": activity_id,
+                "raw_fetched": raw_fetched}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "activity_id": activity_id,
+                "detail": f"{type(exc).__name__}: {exc}"}
+
+
+def garmin_enrich_fetch_estimate(slug: str, *, start: Optional[str] = None,
+                                 end: Optional[str] = None,
+                                 sport: Optional[str] = None) -> dict:
+    """Оценка ВРЕМЕНИ сетевой докачки enrich (для решения N-точечных-vs-CLI).
+
+    Живёт в net_tools по ДОМЕНУ ЗНАНИЯ (владеет throttle-pace), НЕ потому что ходит в
+    сеть — НЕ ходит (count из кэша, pace — константа). Третий класс: сетевой домен,
+    не сетевое действие (см. docstring модуля). Под forbid_network проходит зелёным.
+
+    count_missing_raw — тот же единый предикат (count_enrich_pending, cache-only), что и
+    garmin_enrich_estimate (Q8). Время = count × pace_s (throttle, _best_case: без
+    retry/backoff — нижняя граница, как sync-estimate Q5). Это ЗАКРЫВАЕТ Q9-дыру «время
+    сетевой части — домен сетевого estimate, которого нет»: теперь есть, по адресу.
+
+    Пара к garmin_enrich_estimate: тот даёт СКОЛЬКО (два count, cache-only), этот —
+    СКОЛЬКО ВРЕМЕНИ на сетевую часть. Зови этот, если count_missing_raw > 0 и решаешь
+    N-точечных-fetch vs CLI.
+    """
+    from store import Store as _Store
+    from enrich import ALGO_VERSION
+    # pace — сетевое знание, здесь legal (net_tools). fetch.py владеет им; читаем как факт
+    # throttle (не создаём Fetcher, сеть не трогаем).
+    from fetch import DEFAULT_PACE_S
+
+    prof = profiles.resolve(slug)
+    with _Store(prof.db_path) as st:
+        counts = st.count_enrich_pending(ALGO_VERSION, start=start, end=end, sport=sport)
+    missing = counts["missing_raw"]
+    est_hours = missing * DEFAULT_PACE_S / 3600.0
+    return {
+        "count_missing_raw": missing,
+        "estimated_hours_best_case": round(est_hours, 3),
+        "note": "best_case: без retry/backoff (нижняя граница). Большой count → CLI "
+                "enrich_batch, не N MCP-вызовов.",
     }

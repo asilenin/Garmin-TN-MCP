@@ -148,6 +148,26 @@ def garmin_sync_catalog(start: str, end: str) -> dict:
     return net_tools.garmin_sync_catalog(_slug(), start, end)
 
 
+@mcp.tool()
+def garmin_enrich_fetch(activity_id: int) -> dict:
+    """Скачать сырьё ОДНОЙ активности (streams+laps+watch-лактат) из Garmin и обогатить.
+    СЕТЕВОЙ write, точечный. Замыкает цепочку sync→streams→enrich: для активностей, что
+    в каталоге есть, но без streams (garmin_enrich_activity вернул no_raw). Для малого N;
+    большой объём — CLI enrich_batch. Оцени объём: garmin_enrich_estimate (count) +
+    garmin_enrich_fetch_estimate (время). status: enriched/already/not_found/error."""
+    return net_tools.garmin_enrich_fetch(_slug(), activity_id)
+
+
+@mcp.tool()
+def garmin_enrich_fetch_estimate(start: str | None = None, end: str | None = None,
+                                 sport: str | None = None) -> dict:
+    """Оценка ВРЕМЕНИ сетевой докачки enrich (count_missing_raw × throttle-pace,
+    best_case без retry). Пара к garmin_enrich_estimate: тот — СКОЛЬКО (count), этот —
+    СКОЛЬКО ВРЕМЕНИ на сетевую часть. Зови, если count_missing_raw > 0 и решаешь
+    N-точечных-fetch vs CLI. Сеть НЕ трогает (оценка из кэша)."""
+    return net_tools.garmin_enrich_fetch_estimate(_slug(), start=start, end=end, sport=sport)
+
+
 def main() -> None:
     global _SLUG
     _SLUG = os.environ.get("GARMIN_TN_PROFILE")
@@ -194,7 +214,7 @@ if __name__ == "__main__":
         for fn in (garmin_compact, garmin_full, garmin_query, garmin_aggregates,
                    garmin_status, garmin_add_lactate, garmin_add_note, garmin_delete_mark,
                    garmin_wellness, garmin_enrich_activity, garmin_enrich_estimate,
-                   garmin_sync_catalog):
+                   garmin_sync_catalog, garmin_enrich_fetch, garmin_enrich_fetch_estimate):
             assert "slug" not in inspect.signature(fn).parameters, f"slug в схеме {fn.__name__}"
         print("1 slug НЕ в сигнатуре тулов ✓ (вкл. 7.6: wellness/enrich/sync)")
 
