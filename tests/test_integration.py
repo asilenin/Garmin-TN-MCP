@@ -119,16 +119,19 @@ print("G delete OK")
 # Три состояния каталога (Q12/Q15): значение ('chest'/'unknown') / NULL (не посчитано).
 # unknown — ЗНАЧЕНИЕ («не знаю» как факт), NULL — отсутствие ключа. Не схлопывать.
 with Store(prof.db_path) as st:
-    st.conn.execute("UPDATE activities SET hr_source='unknown', device_model='3350970362' "
-                    "WHERE activity_id=111")
+    st.conn.execute("UPDATE activities SET hr_source='unknown', device_model='3350970362', "
+                    "biomech_source='foot-pod' WHERE activity_id=111")
     st.conn.commit()
 _c = tools.get_activity_compact(SLUG, 111)
 assert _c.get("hr_source") == "unknown", _c
 assert _c.get("device_model") == "3350970362", _c
+assert _c.get("biomech_source") == "foot-pod", _c
 assert tools.get_activity_full(SLUG, 111).get("hr_source") == "unknown"
+assert tools.get_activity_full(SLUG, 111).get("biomech_source") == "foot-pod"
 _c2 = tools.get_activity_compact(SLUG, 222)
 assert "hr_source" not in _c2 and "device_model" not in _c2, _c2
-print("I 7.6-2a: hr_source условная эмиссия (unknown=значение, NULL=нет ключа) OK")
+assert "biomech_source" not in _c2, _c2   # NULL → нет ключа
+print("I 7.6-2a/2b: hr_source+biomech_source условная эмиссия (значение/NULL) OK")
 
 # --- 7.6-2(a'): upsert каталога не перетирает enrich-owned; INSERT несёт сид ---
 # Wipe-класс: UPDATE-ветка upsert затирала hr_source/moving_time_s/max_hr сидами
