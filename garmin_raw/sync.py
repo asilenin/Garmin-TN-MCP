@@ -533,6 +533,19 @@ if __name__ == "__main__":
         # Работа и БД-коммиты уже завершены, выходим чисто.
         os._exit(0)
 
+    # argv-safety: сюда доходим, только если argv[2] НЕ совпал ни с одной подкомандой
+    # выше. Раньше любой нераспознанный argv[2] молча проваливался в полный сетевой
+    # sync_catalog (горизонт 20 лет) — опечатка «statsu» = архивный синк. Теперь:
+    # нераспознанная подкоманда → ошибка+usage; дефолтный синк ТОЛЬКО при голом slug
+    # (len==2, без подкоманды — легитимное «синкни каталог»). Различитель — ЕСТЬ ли
+    # argv[2], не «какой он».
+    if len(sys.argv) > 2:
+        print(f"неизвестная подкоманда: {sys.argv[2]!r}")
+        print("usage: python sync.py <slug> "
+              "[status|fetch-aux|recompute|recompute-user-marks|aggregate|enrich [limit]]")
+        print("  без подкоманды — sync каталога (сетевой, полный горизонт)")
+        sys.exit(2)
+
     print(f"sync каталога профиля {slug} (окна по {WINDOW_MONTHS} мес, "
           f"горизонт {HISTORY_YEARS} лет)...")
     r = sync_catalog(slug)
