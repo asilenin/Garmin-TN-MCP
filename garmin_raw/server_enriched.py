@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 import tools  # noqa: E402
+import net_tools  # noqa: E402  (сетевые тулы: wellness, sync_catalog)
 
 # Имя сервера КОНСТАНТНО (не включает slug): различение профилей — по ключу коннектора
 # в конфиге Claude (транспорт), не по имени сервера. Иначе slug утёк бы в идентичность,
@@ -111,6 +112,42 @@ def garmin_delete_mark(mark_id: int) -> dict:
     return tools.delete_lactate(_slug(), mark_id)
 
 
+# ── этап 7.6: wellness / enrich / sync ───────────────────────────────────────
+@mcp.tool()
+def garmin_wellness(date: str, refresh: bool = False) -> dict:
+    """Wellness за дату (сон/HRV/RHR/стресс/BodyBattery). СЕТЕВОЙ read: при валидном
+    кэше сеть не трогается. date — 'YYYY-MM-DD'. refresh=true форсит перекачку всех
+    зондов. Свежесть суди сам по fetched_at и requested_at_age_days (порога в коде нет)."""
+    return net_tools.garmin_wellness(_slug(), date, refresh=refresh)
+
+
+@mcp.tool()
+def garmin_enrich_activity(activity_id: int) -> dict:
+    """Обогатить ОДНУ активность из уже скачанного сырья (streams в кэше). CACHE-ONLY,
+    без сети. status: enriched/already/no_raw/not_found/error. no_raw = streams нет в
+    кэше (нужен сетевой путь/sync), НЕ ошибка тула."""
+    return tools.enrich_activity(_slug(), activity_id)
+
+
+@mcp.tool()
+def garmin_enrich_estimate(start: str | None = None, end: str | None = None,
+                           sport: str | None = None) -> dict:
+    """Оценка объёма недостающего обогащения (CACHE-ONLY). Два count:
+    count_has_raw_no_enrich (cache-only точечный enrich) + count_missing_raw (нужен
+    сетевой fetch). БЕЗ времени: cache-only часть — количество единиц (реши точечно/
+    терминал по числу), сетевая — оценивается сетевым estimate (пока не реализован)."""
+    return tools.enrich_estimate(_slug(), start=start, end=end, sport=sport)
+
+
+@mcp.tool()
+def garmin_sync_catalog(start: str, end: str) -> dict:
+    """Инкрементально дописать каталог за ЯВНЫЙ диапазон [start, end] (ISO). СЕТЕВОЙ
+    write. Диапазон обязателен: для «докачай свежее» возьми garmin_status.garmin_range[1]
+    (max дата каталога) как start, сегодня как end. Возврат: сколько окон/активностей
+    записано, новый диапазон каталога. Большой архив — НЕ через этот тул (терминал)."""
+    return net_tools.garmin_sync_catalog(_slug(), start, end)
+
+
 def main() -> None:
     global _SLUG
     _SLUG = os.environ.get("GARMIN_TN_PROFILE")
@@ -155,16 +192,22 @@ if __name__ == "__main__":
         # 1) slug НЕ в схеме тулов (I2.1): у обёрток нет параметра slug
         import inspect
         for fn in (garmin_compact, garmin_full, garmin_query, garmin_aggregates,
-                   garmin_status, garmin_add_lactate, garmin_add_note, garmin_delete_mark):
+                   garmin_status, garmin_add_lactate, garmin_add_note, garmin_delete_mark,
+                   garmin_wellness, garmin_enrich_activity, garmin_enrich_estimate,
+                   garmin_sync_catalog):
             assert "slug" not in inspect.signature(fn).parameters, f"slug в схеме {fn.__name__}"
-        print("1 slug НЕ в сигнатуре тулов ✓")
+        print("1 slug НЕ в сигнатуре тулов ✓ (вкл. 7.6: wellness/enrich/sync)")
 
         # 2) read-тулы работают под env-профилем
-        assert garmin_status()["schema_version"] == 5
+        assert garmin_status()["schema_version"] == 6
         assert garmin_compact(111)["activity_id"] == 111
         assert "enriched" in garmin_full(111)
         assert isinstance(garmin_query(limit=5), dict)
-        print("2 read-тулы OK")
+        # cache-only 7.6 (без сети): enrich_estimate/enrich_activity зовём; wellness/
+        # sync_catalog СЕТЕВЫЕ — в self-test не вызываем (нужны токены), только slug-страж выше.
+        assert isinstance(garmin_enrich_estimate(), dict)
+        assert garmin_enrich_activity(999999)["status"] == "not_found"
+        print("2 read-тулы + cache-only 7.6 OK")
 
         # 3) add_lactate: РОВНО одна форма — ноль/две → явная ошибка, одна → работает
         assert "error" in garmin_add_lactate(111, 5.0)                          # ноль
