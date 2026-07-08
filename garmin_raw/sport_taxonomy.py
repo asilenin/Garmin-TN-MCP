@@ -32,17 +32,58 @@ class _SportInfo(NamedTuple):
 
 # ЕДИНАЯ таблица номенклатуры. Одна строка на typeKey — все производные разом.
 # gps_type: indoor ОТДЕЛЬНО от treadmill (belt-assist vs пол, разные GCT/vert §5.4).
-# sport_class: все *_running → run (union для «сколько пробежек» — RUN-CLASS-PREDICATE).
+#   Для НЕ-беговых gps_type=None: признак беговой (GPS-среда для §5.4), к вело/силовой
+#   неприменим — не «нет GPS», а «не тот вопрос».
+# sport_class: run (все *_running) / ride / swim / cardio (прочее выносливостное) /
+#   flexibility / strength / other. Разметка пользователя (циклическое=выносливость для
+#   «замены при травме»; силовое=укрепление формы; гибкость отдельно).
 _TAXONOMY: dict[str, _SportInfo] = {
+    # --- бег (gps_type по среде, §5.4) ---
     "running":            _SportInfo(gps_type="outdoor",   sport_class="run"),
     "trail_running":      _SportInfo(gps_type="outdoor",   sport_class="run"),
     "treadmill_running":  _SportInfo(gps_type="treadmill", sport_class="run"),
     "track_running":      _SportInfo(gps_type="track",     sport_class="run"),
     "indoor_running":     _SportInfo(gps_type="indoor",    sport_class="run"),
-    # cross-training (CROSS-TRAINING-SCOPE) добавит строки: cycling→(None,"ride"),
-    # lap_swimming→(None,"swim"), strength_training→(None,"strength") и т.д. —
-    # каждая новая строка даёт ОБА признака, полнота по построению.
+    # --- велоспорт (циклическое, поддержание/замена) ---
+    "cycling":            _SportInfo(gps_type=None, sport_class="ride"),
+    "road_biking":        _SportInfo(gps_type=None, sport_class="ride"),
+    "indoor_cycling":     _SportInfo(gps_type=None, sport_class="ride"),
+    # --- плавание (циклическое) ---
+    "lap_swimming":       _SportInfo(gps_type=None, sport_class="swim"),
+    "open_water_swimming": _SportInfo(gps_type=None, sport_class="swim"),
+    "swimming":           _SportInfo(gps_type=None, sport_class="swim"),
+    # --- прочее выносливостное кардио ---
+    "rowing_v2":          _SportInfo(gps_type=None, sport_class="cardio"),
+    "elliptical":         _SportInfo(gps_type=None, sport_class="cardio"),
+    "stair_climbing":     _SportInfo(gps_type=None, sport_class="cardio"),
+    "walking":            _SportInfo(gps_type=None, sport_class="cardio"),
+    "hiking":             _SportInfo(gps_type=None, sport_class="cardio"),
+    "breathwork":         _SportInfo(gps_type=None, sport_class="cardio"),
+    "indoor_cardio":      _SportInfo(gps_type=None, sport_class="cardio"),
+    # --- гибкость ---
+    "pilates":            _SportInfo(gps_type=None, sport_class="flexibility"),
+    "yoga":               _SportInfo(gps_type=None, sport_class="flexibility"),
+    # --- силовое (укрепление формы) ---
+    "strength_training":  _SportInfo(gps_type=None, sport_class="strength"),
+    "bouldering":         _SportInfo(gps_type=None, sport_class="strength"),
+    "mountaineering":     _SportInfo(gps_type=None, sport_class="strength"),
+    # --- прочее (валидные тренировки без ясного класса) ---
+    "other":              _SportInfo(gps_type=None, sport_class="other"),
+    "multi_sport":        _SportInfo(gps_type=None, sport_class="other"),
 }
+
+# НЕ-тренировки: служебные события Garmin — НЕ писать в каталог (не summary тренировки).
+# stop_watch — секундомер; incident_detected — детект инцидента/падения. Отличать от
+# «неизвестный typeKey → None» (тот может быть тренировкой, просто новой): скип — явно
+# известные НЕ-тренировки.
+_SKIP_TYPE_KEYS = frozenset({"stop_watch", "incident_detected"})
+
+
+def is_trackable(sport: Optional[str]) -> bool:
+    """typeKey — трекаемая тренировка (писать в каталог)? False для служебных событий
+    Garmin (stop_watch/incident_detected). Неизвестный typeKey → True (может быть новой
+    тренировкой; sport_class=None, но пишем — не теряем данные из-за неизвестности)."""
+    return sport not in _SKIP_TYPE_KEYS
 
 # Известные typeKey — производное от таблицы (единственный источник).
 KNOWN_TYPE_KEYS = frozenset(_TAXONOMY)

@@ -92,7 +92,11 @@ def _fetch_window_with_retry(
     attempt = 0
     while True:
         try:
-            return fetcher.list_activities(w_start, w_end)
+            # sport="" — ВСЕ типы (CROSS-TRAINING): не-беговое (силовые/вело/плавание)
+            # нужно как контекст нагрузки. Раньше дефолт "running" фильтровал на входе
+            # Garmin → не-беговое не попадало в каталог (недобор: mila 1648 из 2558).
+            # Не-тренировки (stop_watch/incident) отсеиваются позже через is_trackable.
+            return fetcher.list_activities(w_start, w_end, "")
         except (RateLimited, Exception) as exc:  # noqa: BLE001
             # SYNC-RETRY-AUTH: login-сбой (протухли токены между окнами) НЕ ретраим —
             # не транзиентный. Признак — текст _connect (fetch.py:88). Пробрасываем сразу.
@@ -184,7 +188,12 @@ def sync_catalog(slug: str, *, history_years: int = HISTORY_YEARS,
                 rep.stop_reason = str(exc)
                 break
 
-            rows = [activity_row_from_summary(a) for a in acts if a]
+            # is_trackable отсеивает НЕ-тренировки (stop_watch/incident_detected) —
+            # служебные события Garmin, не summary тренировки. Неизвестный typeKey
+            # проходит (может быть новой тренировкой, не теряем).
+            from sport_taxonomy import is_trackable
+            rows = [activity_row_from_summary(a) for a in acts
+                    if a and is_trackable((a.get("activityType") or {}).get("typeKey"))]
             # count объёма: под dry_run — сколько Garmin ОТДАЛ БЫ (len), не результат upsert
             if dry_run:
                 n = len(rows)

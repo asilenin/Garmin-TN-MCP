@@ -68,9 +68,47 @@ def test_sport_class_filter_solves_mila_undercount() -> None:
     print("  sport_class=run → 5 беговых (не cycling); sport=running → 1 (недобор) OK")
 
 
+def test_cross_training_classes() -> None:
+    """CROSS-TRAINING: не-беговые классы (ride/swim/cardio/flexibility/strength/other)
+    по разметке пользователя. Полнота всех typeKey обоих профилей."""
+    # ride/swim/strength — по разметке
+    for tk in ("cycling", "road_biking", "indoor_cycling"):
+        assert tax.sport_class_of(tk) == "ride", tk
+    for tk in ("lap_swimming", "open_water_swimming", "swimming"):
+        assert tax.sport_class_of(tk) == "swim", tk
+    for tk in ("strength_training", "bouldering", "mountaineering"):
+        assert tax.sport_class_of(tk) == "strength", tk
+    for tk in ("pilates", "yoga"):
+        assert tax.sport_class_of(tk) == "flexibility", tk
+    # cardio — прочее выносливостное (walking/hiking/breathwork/indoor_cardio/...)
+    for tk in ("walking", "hiking", "rowing_v2", "elliptical", "stair_climbing",
+               "breathwork", "indoor_cardio"):
+        assert tax.sport_class_of(tk) == "cardio", tk
+    # gps_type=None для ВСЕХ не-беговых (признак беговой, §5.4)
+    for tk in tax.KNOWN_TYPE_KEYS:
+        if tax.sport_class_of(tk) != "run":
+            assert tax.gps_type_from_sport(tk) is None, f"{tk} не-беговой с gps_type!"
+    print("  cross-training классы (ride/swim/cardio/flex/strength) + gps_type=None OK")
+
+
+def test_skip_non_workouts() -> None:
+    """Не-тренировки (stop_watch/incident_detected) → is_trackable False (не в каталог).
+    Неизвестный typeKey → True (не теряем возможную новую тренировку)."""
+    assert tax.is_trackable("stop_watch") is False
+    assert tax.is_trackable("incident_detected") is False
+    assert tax.is_trackable("running") is True
+    assert tax.is_trackable("strength_training") is True
+    assert tax.is_trackable("kayaking") is True   # неизвестный → пишем
+    # skip-типы НЕ в _TAXONOMY (не классифицируются как тренировки)
+    assert tax.sport_class_of("stop_watch") is None
+    print("  is_trackable: skip не-тренировки, неизвестный проходит OK")
+
+
 if __name__ == "__main__":
     test_derivatives_complete_over_source()
     test_all_running_are_run_class()
     test_unknown_class_and_typekey()
     test_sport_class_filter_solves_mila_undercount()
-    print("sport_taxonomy + RUN-CLASS-PREDICATE тесты — ЗЕЛЁНЫЕ")
+    test_cross_training_classes()
+    test_skip_non_workouts()
+    print("sport_taxonomy + RUN-CLASS-PREDICATE + CROSS-TRAINING тесты — ЗЕЛЁНЫЕ")
