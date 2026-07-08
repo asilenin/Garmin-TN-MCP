@@ -59,7 +59,7 @@ import numpy as np
 # (hr_source/moving_time_s/max_hr), стёртых wipe-багом upsert (fix 7.6-2a'):
 # hr_source в enriched-строках не хранится, только поднимается в каталог put_enriched;
 # перезапись той же версии запрещена (этап 6) -> честный путь восстановления = bump.
-ALGO_VERSION = "enrich-0.6.1"
+ALGO_VERSION = "enrich-0.6.2"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -197,6 +197,18 @@ K_ELEV = "directElevation"
 # детерминированный признак нагрудника → hr_source=chest (enrich-0.6.0, §3.5.1).
 K_GCT_BALANCE = "directGroundContactBalanceLeft"
 
+# biomech_source (T7.6-2b): признак присутствия Stryd footpod в потоке.
+# ФАКТ (проверено на двух классах — Stryd-активность vs trail без Stryd-датафилда):
+# Stryd пишет developer-поля с этим appID в metricDescriptors. GCT/vert-ratio/stride
+# приходят как НАТИВНЫЕ Garmin-поля (appID=None) И с часов (watch-only), И со Stryd —
+# наличие GCT само по себе НЕ различает источник (has_biomech_sensor слеп к провенансу).
+# Различитель — присутствие Stryd-appID: есть → footpod пишет biomech (foot-pod);
+# нет → биомеханика от встроенного акселерометра часов (watch-only).
+# Это признак ПРИСУТСТВИЯ Stryd, не источника каждого поля — но для провенанса достаточно
+# (Stryd подключён = biomech идёт от него). Пороги отсутствуют (наличие appID, как
+# hr_source по наличию balance — механический перевод факта в категорию, не суждение).
+_STRYD_APPID = "18fb2cf0-1a4b-430d-ad66-988c847421f4"
+
 
 def _index_map(stream: dict) -> dict[str, int]:
     """key → metricsIndex по metricDescriptors."""
@@ -236,6 +248,32 @@ def _hr_source_from_stream(idx: dict, has_hr: bool) -> str:
     if K_GCT_BALANCE in idx:
         return "chest"
     return "unknown"
+
+
+def _biomech_source_from_stream(descs: list, has_biomech: bool) -> Optional[str]:
+    """Определяет biomech_source по присутствию Stryd-appID в metricDescriptors
+    (enrich-0.6.2, T7.6-2b). ФАКТ (два класса: Stryd-активность vs trail без Stryd):
+      Stryd-appID есть  → 'foot-pod' (biomech пишет footpod Stryd);
+      Stryd-appID нет,
+        но biomech есть  → 'watch-only' (GCT/vert-ratio от встроенного акселерометра);
+      biomech нет вообще → None (нечего атрибутировать).
+
+    'run-pod' (TZ-словарь) НЕ эмитится: наблюдаемых образцов нет (нагрудный biomech-
+    датчик отдельным appID в архиве не встретился). Эмитим только ДВА наблюдаемых
+    класса — не выдумываем третий без образца. Признак — наличие appID (механический
+    перевод, не суждение; пороги отсутствуют, как hr_source по balance).
+
+    ВАЖНО: watch-only даёт GCT/vert-ratio, но НЕ GCT-balance (L/R) — balance физически
+    только с нагрудника. foot-pod (Stryd) тоже перебивает balance → на Stryd-активности
+    balance нет, hr_source уезжает в unknown (см. _hr_source_from_stream). biomech_source
+    ='foot-pod' восстанавливает для LLM провенанс: unknown+foot-pod может быть chest+Stryd,
+    не оптика."""
+    if not has_biomech:
+        return None
+    for m in descs:
+        if m.get("appID") == _STRYD_APPID:
+            return "foot-pod"
+    return "watch-only"
 
 
 def _column(rows: list[dict], idx: Optional[int]) -> np.ndarray:
@@ -1059,6 +1097,10 @@ def enrich_activity(
                    if hr_clean[~np.isnan(hr_clean)].size else None),
         "hr_source": _hr_source_from_stream(
             idx, has_hr=bool(hr_clean[~np.isnan(hr_clean)].size)),
+        "biomech_source": _biomech_source_from_stream(
+            descs, has_biomech=bool(
+                (gct is not None and not np.all(np.isnan(gct)))
+                or (vr is not None and not np.all(np.isnan(vr))))),
     }
 
 

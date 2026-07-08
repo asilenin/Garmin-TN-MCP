@@ -593,13 +593,14 @@ class Store:
         mc = enriched.get("median_crossings")
         mx = enriched.get("max_hr")
         hrs = enriched.get("hr_source")   # §3.5.1: chest (balance в потоке) / unknown
-        # hr_source пишем ПРЯМО (не COALESCE): при recompute со сменой логики извлечения
-        # он должен ОБНОВИТЬСЯ, а COALESCE сохранил бы старое значение. max_hr —
-        # COALESCE, т.к. может быть из сводки до обогащения; hr_source только из enrich.
+        bms = enriched.get("biomech_source")  # T7.6-2b: foot-pod/watch-only/None
+        # hr_source/biomech_source пишем ПРЯМО (не COALESCE): при recompute со сменой
+        # логики извлечения они должны ОБНОВИТЬСЯ, а COALESCE сохранил бы старое. max_hr —
+        # COALESCE, т.к. может быть из сводки до обогащения; enrich-owned — только из enrich.
         self.conn.execute(
             "UPDATE activities SET moving_time_s=COALESCE(?,moving_time_s), "
-            "max_hr=COALESCE(?,max_hr), hr_source=? WHERE activity_id=?",
-            (mt, mx, hrs, activity_id),
+            "max_hr=COALESCE(?,max_hr), hr_source=?, biomech_source=? WHERE activity_id=?",
+            (mt, mx, hrs, bms, activity_id),
         )
         # median_crossings храним в interest_index (дешёвый сигнал для отбора/фильтра)
         self.conn.execute(
