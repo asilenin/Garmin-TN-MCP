@@ -96,17 +96,16 @@ def _catalog_row(st: Store, aid: int) -> Optional[dict]:
     r = st.conn.execute(
         "SELECT activity_id,date,sport,distance_m,duration_s,moving_time_s,max_hr,"
         "avg_cadence,avg_hr_raw,has_biomech_sensor,lap_count,hr_source,device_model,"
-        "biomech_source "
+        "biomech_source,gps_type "
         "FROM activities WHERE activity_id=?", (aid,)
     ).fetchone()
     if r is None:
         return None
     row = dict(r)
-    # hr_source/device_model/biomech_source — условная эмиссия (7.6-2a/2b): NULL (не
-    # посчитано, нет enriched) → ключа НЕТ; значение ('unknown'/'foot-pod'/'watch-only'
-    # /device) → отдаётся КАК ЗНАЧЕНИЕ. Схлопнуть NULL и значение нельзя: LLM обязан
-    # видеть «не знаю» как факт (§5.4 — пульс/биомех под флагом источника).
-    for k in ("hr_source", "device_model", "biomech_source"):
+    # hr_source/device_model/biomech_source/gps_type — условная эмиссия (7.6-2a/2b): NULL
+    # (не посчитано, нет enriched) → ключа НЕТ; значение → отдаётся КАК ЗНАЧЕНИЕ. Схлопнуть
+    # NULL и значение нельзя: LLM обязан видеть «не знаю» как факт (§5.4).
+    for k in ("hr_source", "device_model", "biomech_source", "gps_type"):
         if row.get(k) is None:
             row.pop(k, None)
     return row
@@ -435,10 +434,15 @@ def enrich_activity(slug: str, activity_id: int) -> dict:
         laps = st.get_raw(activity_id, "laps")
         craw = st.get_raw(activity_id, "comment")
         comment = craw.get("lactate_mmol", []) if isinstance(craw, dict) else []
+        # sport из каталога → gps_type (страж согласованности: sport для ЭТОГО id)
+        _sp = st.conn.execute("SELECT sport FROM activities WHERE activity_id=?",
+                              (activity_id,)).fetchone()
+        sport = _sp[0] if _sp else None
         try:
             enriched = _enrich_engine(
                 stream, laps=laps,
                 lactate_watch_points=[], lactate_comment_values=comment,
+                sport=sport,
             )
             st.put_enriched(activity_id, enriched)
             st.backfill_device_model(activity_id)

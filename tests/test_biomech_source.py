@@ -43,7 +43,7 @@ def test_run_pod_not_invented() -> None:
 
 def test_version_bumped() -> None:
     """biomech_source — новое поле → версия поднята (иначе has_enriched не пересчитает)."""
-    assert ALGO_VERSION == "enrich-0.6.2", ALGO_VERSION
+    assert ALGO_VERSION == "enrich-0.6.3", ALGO_VERSION
     print(f"  ALGO_VERSION = {ALGO_VERSION} (bump под biomech_source) OK")
 
 

@@ -311,10 +311,14 @@ def enrich_batch(slug: str, *, limit: int = 200, start: Optional[str] = None,
                 # Кэшированы для всех (долг закрыт); offline берём из БД, online —
                 # докачиваем выше при первом скачивании streams.
                 laps = st.get_raw(aid, "laps")
+                # sport из каталога → gps_type (согласован с ЭТИМ aid)
+                _sp = st.conn.execute("SELECT sport FROM activities WHERE activity_id=?",
+                                      (aid,)).fetchone()
                 # обогащение
                 enriched = enrich_activity(
                     stream, laps=laps,
                     lactate_watch_points=lact, lactate_comment_values=comment,
+                    sport=(_sp[0] if _sp else None),
                 )
                 st.put_enriched(aid, enriched)
                 # device_model из сохранённого summary_json (deviceId — факт железа).

@@ -59,7 +59,7 @@ import numpy as np
 # (hr_source/moving_time_s/max_hr), стёртых wipe-багом upsert (fix 7.6-2a'):
 # hr_source в enriched-строках не хранится, только поднимается в каталог put_enriched;
 # перезапись той же версии запрещена (этап 6) -> честный путь восстановления = bump.
-ALGO_VERSION = "enrich-0.6.2"
+ALGO_VERSION = "enrich-0.6.3"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -208,6 +208,30 @@ K_GCT_BALANCE = "directGroundContactBalanceLeft"
 # (Stryd подключён = biomech идёт от него). Пороги отсутствуют (наличие appID, как
 # hr_source по наличию balance — механический перевод факта в категорию, не суждение).
 _STRYD_APPID = "18fb2cf0-1a4b-430d-ad66-988c847421f4"
+
+# gps_type (T7.6-2b): GPS-СРЕДА из декларации пользователя (sport/typeKey Garmin).
+# ДОВЕРЯЕМ РАЗМЕТКЕ — механический перевод словаря номенклатуры, НЕ инференс из данных
+# (темп/lap_count не используются: вывод среды из сигнала заменил бы декларацию догадкой).
+# Пять значений; indoor ОТДЕЛЬНО от treadmill (не схлопывать): дорожка несёт бегуна
+# belt-assist, пол — нет → систематически разные GCT/vert-ratio (МЕТОД §5.4 межгодовое
+# сравнение). Схлопывание = невосстановимая потеря (typeKey свёрнут при записи, recompute
+# не вернёт). indoor ('без GPS, не дорожка') ≠ None ('typeKey не распознан').
+_GPS_TYPE_BY_SPORT = {
+    "running": "outdoor",
+    "trail_running": "outdoor",
+    "treadmill_running": "treadmill",
+    "track_running": "track",       # круговой GPS с систематической погрешностью дистанции
+    "indoor_running": "indoor",
+}
+
+
+def _gps_type_from_sport(sport: Optional[str]) -> Optional[str]:
+    """typeKey → gps_type по словарю декларации. Неизвестный/None typeKey → None
+    ('не распознан', не гадаем — расширяемо новым typeKey). Механический перевод, не
+    суждение (пороги отсутствуют)."""
+    if sport is None:
+        return None
+    return _GPS_TYPE_BY_SPORT.get(sport)   # неизвестный → None
 
 
 def _index_map(stream: dict) -> dict[str, int]:
@@ -977,6 +1001,7 @@ def enrich_activity(
     laps: Optional[dict] = None,
     lactate_watch_points: Optional[list[dict]] = None,
     lactate_comment_values: Optional[list[float]] = None,
+    sport: Optional[str] = None,
 ) -> dict:
     """Главная функция: сырой поток → числовые характеристики (МЕТОД §3.1).
 
@@ -1014,6 +1039,8 @@ def enrich_activity(
             "elevation": {"gain_m": None, "loss_m": None},
             "max_hr": None,
             "hr_source": "unknown",   # нет потока → источник неопределим
+            "biomech_source": None,   # нет потока → appID не проверить
+            "gps_type": _gps_type_from_sport(sport),  # sport известен и без потока
             "no_stream": True,   # пометка: детальный поток отсутствовал
         }
 
@@ -1101,6 +1128,7 @@ def enrich_activity(
             descs, has_biomech=bool(
                 (gct is not None and not np.all(np.isnan(gct)))
                 or (vr is not None and not np.all(np.isnan(vr))))),
+        "gps_type": _gps_type_from_sport(sport),
     }
 
 

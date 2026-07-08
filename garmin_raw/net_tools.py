@@ -256,10 +256,14 @@ def garmin_enrich_fetch(slug: str, activity_id: int) -> dict:
             except Exception:  # noqa: BLE001
                 comment = []
             laps = st.get_raw(activity_id, "laps")
+            # sport из каталога → gps_type (согласован с ЭТИМ id)
+            _sp = st.conn.execute("SELECT sport FROM activities WHERE activity_id=?",
+                                  (activity_id,)).fetchone()
             # обогащение — ЕДИНАЯ точка входа: сырой watch-лактат в движок, без шортката
             enriched = _enrich_engine(
                 stream, laps=laps,
                 lactate_watch_points=lact, lactate_comment_values=comment,
+                sport=(_sp[0] if _sp else None),
             )
             st.put_enriched(activity_id, enriched)
             st.backfill_device_model(activity_id)
