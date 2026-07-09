@@ -65,9 +65,9 @@ def test_predicate_single_source() -> None:
 
 
 def test_predicate_consistency() -> None:
-    """СТРАЖ согласованности has_raw ↔ count_enrich_pending (Q8/Q9): один критерий в
+    """СТРАЖ согласованности has_raw ↔ count_enrich_pending (TOOL-READ-NET-SPLIT/INV-NO-DOMAIN-LEAK): один критерий в
     двух формах (точечная / агрегатная) не должен разъехаться. Проверка ПОВЕДЕНИЯ, не
-    текста SQL (текстовая константа не ловит структурный разъезд — ср. upsert Q2).
+    текста SQL (текстовая константа не ловит структурный разъезд — ср. upsert INV-ENRICH-OWNED-COLS).
     Две ветки в ОБЕ стороны — missing_raw создаётся ПОЛНЫМ отсутствием строки, не
     пустым put_raw (это разные состояния: нет строки vs строка с мусором; has_raw
     проверяет наличие строки)."""
@@ -92,10 +92,10 @@ def test_predicate_consistency() -> None:
 
 
 def test_estimate_cache_only_shape() -> None:
-    """enrich_estimate возвращает ДВА count, НЕ время (асимметрия намеренна, Q9)."""
+    """enrich_estimate возвращает ДВА count, НЕ время (асимметрия намеренна, INV-NO-DOMAIN-LEAK)."""
     r = tools.enrich_estimate(SLUG)
     assert set(r) == {"count_has_raw_no_enrich", "count_missing_raw"}, r
-    assert "estimated_hours_best_case" not in r, "время просочилось в cache-only estimate (Q9)"
+    assert "estimated_hours_best_case" not in r, "время просочилось в cache-only estimate (INV-NO-DOMAIN-LEAK)"
     assert isinstance(r["count_has_raw_no_enrich"], int)
     print(f"  estimate: два count без времени {r} OK")
 

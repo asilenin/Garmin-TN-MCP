@@ -1,4 +1,4 @@
-"""test_sync_estimate.py — garmin_sync_estimate (Q5): объём/время синка ДО закачки.
+"""test_sync_estimate.py — garmin_sync_estimate (SYNC-EXPLICIT-RANGE): объём/время синка ДО закачки.
 
 Сетевой read (list_activities за окна). Ключевое:
   (1) dry_run НЕ мутирует каталог/meta (страж тихого рассинхрона meta↔каталог);
@@ -22,7 +22,7 @@ prof = profiles.resolve(SLUG); prof.ensure_dirs()
 
 
 def test_range_required() -> None:
-    """Диапазон обязателен вместе (Q5, до сети)."""
+    """Диапазон обязателен вместе (SYNC-EXPLICIT-RANGE, до сети)."""
     try:
         sync_catalog(SLUG, start_date="2026-07-01", dry_run=True)  # end нет
         raise AssertionError("одиночный start не отвергнут")

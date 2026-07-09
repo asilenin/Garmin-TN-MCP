@@ -1,12 +1,12 @@
-"""Автотест T7.5-4/5 (QA 7.5 Q7/Q8): entry-point garmin-tn-mcp + профильная установка.
+"""Автотест T7.5-4/5 (QA 7.5 CI-PROVIDER-BY-TRANSPORT/INV-TOKENSTORE-BY-FLAG): entry-point garmin-tn-mcp + профильная установка.
 
 Приёмка (1) — автоматизируемая, здесь:
   A. install_tn пишет корректный per-slug конфиг (env, merge-safe, идемпотентно,
      сырьевой garmin-raw цел) + предупреждение при профиле без токенов и без --tokenstore.
-  B. entry-резолв через Q7-отказ: garmin-tn-mcp БЕЗ env → быстрый ненулевой exit с нашим
+  B. entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ: garmin-tn-mcp БЕЗ env → быстрый ненулевой exit с нашим
      текстом про GARMIN_TN_PROFILE. Не резолвится (нет в PATH) → SKIP с инструкцией.
      Резолвится, но не наш текст → КРАСНЫЙ (entry указывает не туда). Таймаут → КРАСНЫЙ
-     (Q7-падение должно быть ДО mcp.run(), без stdio-лупа).
+     (CI-PROVIDER-BY-TRANSPORT-падение должно быть ДО mcp.run(), без stdio-лупа).
   C. MCP handshake: initialize + tools/list → 8 тулов garmin_*, slug НЕ в inputSchema.
      Через module-invocation (всегда доступно), чтобы проверять поверхность даже без
      установленного entry; таймаут+stderr против немого висяка.
@@ -92,7 +92,7 @@ def test_install_config():
     print("A install-конфиг: per-slug env, merge-safe, идемпотент, warn, uninstall ✓")
 
 
-# ── B. entry-резолв через Q7-отказ ────────────────────────────────────────────
+# ── B. entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ ────────────────────────────────────────────
 def test_entry_resolves_via_q7():
     env = {k: v for k, v in os.environ.items() if k != "GARMIN_TN_PROFILE"}
     try:
@@ -103,13 +103,13 @@ def test_entry_resolves_via_q7():
               "(запусти через `uv run` или `uv sync` для установки entry-points)")
         return
     except subprocess.TimeoutExpired:
-        raise AssertionError("garmin-tn-mcp БЕЗ профиля завис — Q7-падение должно быть "
+        raise AssertionError("garmin-tn-mcp БЕЗ профиля завис — CI-PROVIDER-BY-TRANSPORT-падение должно быть "
                              "ДО mcp.run() (регресс порядка в main()?)")
-    assert p.returncode != 0, f"без профиля должен упасть (Q7); rc={p.returncode}"
+    assert p.returncode != 0, f"без профиля должен упасть (CI-PROVIDER-BY-TRANSPORT); rc={p.returncode}"
     assert "GARMIN_TN_PROFILE" in p.stderr, (
-        f"резолвится, но stderr не наш Q7-текст — entry указывает не туда?\n"
+        f"резолвится, но stderr не наш CI-PROVIDER-BY-TRANSPORT-текст — entry указывает не туда?\n"
         f"rc={p.returncode} stderr={p.stderr!r}")
-    print("B entry-резолв через Q7-отказ ✓")
+    print("B entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ ✓")
 
 
 # ── C. MCP handshake: initialize + tools/list ─────────────────────────────────

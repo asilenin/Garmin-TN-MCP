@@ -3,23 +3,23 @@
 ДЕМАРКАЦИЯ (сквозной принцип, ТЗ §1.1, МЕТОД §1.8): aggregate считает якорь-нейтральные,
 БЕЗЫМЯННЫЕ агрегаты и прикладывает провенанс. Всё, что требует порога-якоря, имени или
 суждения (intensity_distribution, фиксированный pace_at_fixed_hr, «база держит»,
-«сравнимо ли») — НЕ здесь, это LLM. Журнал решений: TN_Garmin_MCP_QA.md, этап 5.
+«сравнимо ли») — НЕ здесь, это LLM. Журнал решений: TN_Run_MCP_QA.md, этап 5 (INV-DEMARCATION).
 
 Вход — ТОЛЬКО enriched (компактные строки) + каталог. streams массово НЕ читаются
-(это сделало бы aggregate тяжёлым и вывело формулы из-под версионирования — см. QA Q6).
+(это сделало бы aggregate тяжёлым и вывело формулы из-под версионирования — см. QA AGG-READS-ENRICHED).
 Всё streams/laps-зависимое уже посчитано в enrich (decoupling, hr_recovery, бакеты).
 
 Что считает (все якорь-нейтральные):
 - volume_7d/28d        — скользящие окна км (якоря нет)
 - max_hr_accumulated   — ~97-й перцентиль распределения per-activity max (НЕ max(), §2.4)
 - pace_by_hr_grid       — темп по сетке HR, BY_SOURCE (§3.5.1); ячейка {center,dispersion,
-                          seconds,n_activities} из сложенных sum/sum_sq (Q3)
+                          seconds,n_activities} из сложенных sum/sum_sq (AGG-BUCKET-ADDITIVE)
 - gct_by_pace_grid      — биомеханика по сетке темпа, одной строкой (железо-незав.)
-- decoupling            — 2D (value × Δpace по бинам-осям) + факты; БЕЗ счётчиков (Q11)
-- hr_recovery           — распределение hr_drop+duration, не схлопывать (Q8/Q9)
-- provenance            — hr_sources/device_models с долями и n; unknown как «не знаю» (Q12)
+- decoupling            — 2D (value × Δpace по бинам-осям) + факты; БЕЗ счётчиков (INV-NO-CATEGORY-COUNTERS)
+- hr_recovery           — распределение hr_drop+duration, не схлопывать (INV-ROBUST-EXTREME/INV-DISTINCT-REASONS)
+- provenance            — hr_sources/device_models с долями и n; unknown как «не знаю» (AGG-UNKNOWN-NOT-CLEAN)
 
-period_key НЕ хардкодит кварталы — допускает другие гранулярности (Q5).
+period_key НЕ хардкодит кварталы — допускает другие гранулярности (AGG-PERIOD-GRANULARITY).
 """
 
 from __future__ import annotations
@@ -35,10 +35,10 @@ from enrich import ALGO_VERSION
 
 # --- Параметры агрегации (версионируемы вместе с ALGO_VERSION) -----------------
 ARCHIVE_MAX_HR_PERCENTILE = 97.0   # §2.4: потолок = 97-й перцентиль per-activity max, не max()
-DECOUPLING_DELTA_PACE_BINS = [-1e9, -20, -8, 8, 20, 1e9]  # бины Δpace (сек/км) как ОСИ (Q11)
+DECOUPLING_DELTA_PACE_BINS = [-1e9, -20, -8, 8, 20, 1e9]  # бины Δpace (сек/км) как ОСИ (INV-NO-CATEGORY-COUNTERS)
 # Δpace = pace_2nd − pace_1st. Отрицательный = 2-я половина быстрее (разгон/прогрессив).
 # Бины: сильный разгон / разгон / держался / замедление / сильное замедление.
-# Это ОСИ гистограммы, не вердикт «прогрессив» (Q11: бин ≠ счётчик-порог).
+# Это ОСИ гистограммы, не вердикт «прогрессив» (INV-NO-CATEGORY-COUNTERS: бин ≠ счётчик-порог).
 HR_DROP_BINS = [-1e9, 0, 10, 20, 30, 40, 1e9]  # бины падения HR (уд) как оси для hr_recovery
 
 
@@ -63,7 +63,7 @@ def _percentile(values: list[float], q: float) -> Optional[float]:
 
 
 def _quarter_key(d: str) -> str:
-    """YYYY-MM-DD → YYYY-Qn. period_key допускает и другие гранулярности (Q5):
+    """YYYY-MM-DD → YYYY-Qn. period_key допускает и другие гранулярности (AGG-PERIOD-GRANULARITY):
     меняется только эта функция, схема не трогается."""
     y, m, _ = d.split("-")
     q = (int(m) - 1) // 3 + 1
@@ -79,12 +79,12 @@ def _bin_index(value: float, edges: list[float]) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Сложение достаточной статистики бакетов (Q3: sum/sum_sq/seconds аддитивны)
+# Сложение достаточной статистики бакетов (AGG-BUCKET-ADDITIVE: sum/sum_sq/seconds аддитивны)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fold_suffstat(acc: dict, cell: dict) -> None:
     """Складывает {sum,sum_sq,seconds} ячейки в аккумулятор (in-place).
-    Суммы аддитивны — точное объединение по периоду (Q3)."""
+    Суммы аддитивны — точное объединение по периоду (AGG-BUCKET-ADDITIVE)."""
     if not cell:
         return
     acc["sum"] = acc.get("sum", 0.0) + cell.get("sum", 0.0)
@@ -96,7 +96,7 @@ def _fold_suffstat(acc: dict, cell: dict) -> None:
 def _suffstat_to_center_dispersion(acc: dict) -> Optional[dict]:
     """{sum,sum_sq,seconds,n} → {center, dispersion, seconds, n_activities}.
     center = sum/seconds (взвешенное среднее); dispersion = √(sum_sq/seconds − center²)
-    (std пула). Оба выводятся на ЧТЕНИИ из аддитивной статистики (Q3 — не фиксируем).
+    (std пула). Оба выводятся на ЧТЕНИИ из аддитивной статистики (AGG-BUCKET-ADDITIVE — не фиксируем).
     dispersion — ФЛАГ достоверности center (широкий → LLM не берёт точку), не сигнал."""
     sec = acc.get("seconds", 0.0)
     if sec <= 0:
@@ -121,7 +121,7 @@ def _aggregate_pace_by_hr(enr_rows: list[dict], hr_source_by_id: dict) -> dict:
     по hr_source. HR — ось числа: смешивать источники на входе нельзя (оптика врёт на
     высоком пульсе, среднее с нагрудником — мусор; provenance снаружи это не расцепит).
 
-    Сейчас hr_source NULL у всех → одна под-сетка 'unknown' (Q12). unknown = «не знаю,
+    Сейчас hr_source NULL у всех → одна под-сетка 'unknown' (AGG-UNKNOWN-NOT-CLEAN). unknown = «не знаю,
     возможно менялся», НЕ «однородно»: LLM обязан пометить пульсовую динамику
     недостоверной, пока источник не разложен. Структура оживёт без переписывания, когда
     hr_source заполнится (следующий пункт после aggregate)."""
@@ -177,11 +177,11 @@ def _aggregate_gct_by_pace(enr_rows: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# decoupling: 2D (value × Δpace), БЕЗ счётчиков категорий (Q11)
+# decoupling: 2D (value × Δpace), БЕЗ счётчиков категорий (INV-NO-CATEGORY-COUNTERS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _aggregate_decoupling(enr_rows: list[dict]) -> dict:
-    """decoupling периода как 2D-РАСПРЕДЕЛЕНИЕ (value × Δpace), НЕ счётчики (Q11).
+    """decoupling периода как 2D-РАСПРЕДЕЛЕНИЕ (value × Δpace), НЕ счётчики (INV-NO-CATEGORY-COUNTERS).
 
     Счётчик n_progressive прятал бы порог: чтобы посчитать «сколько прогрессивов»,
     aggregate должен классифицировать тренировку по границе Δpace = зашитое суждение
@@ -232,7 +232,7 @@ def _aggregate_decoupling(enr_rows: list[dict]) -> dict:
             "value_median": round(_percentile(vals, 50), 4),
             "value_p75": round(_percentile(vals, 75), 4),
             "median_pace_variance": round(_percentile(b["pace_variances"], 50), 1)
-                if b["pace_variances"] else None,   # ловит пилу (Q10)
+                if b["pace_variances"] else None,   # ловит пилу (INV-NO-ABS-THRESHOLD)
             "median_duration_s": round(_percentile(b["durations"], 50), 1)
                 if b["durations"] else None,
         })
@@ -240,7 +240,7 @@ def _aggregate_decoupling(enr_rows: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# hr_recovery: распределение hr_drop+duration, не схлопывать (Q8/Q9)
+# hr_recovery: распределение hr_drop+duration, не схлопывать (INV-ROBUST-EXTREME/INV-DISTINCT-REASONS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _aggregate_hr_recovery(enr_rows: list[dict]) -> dict:
@@ -324,7 +324,7 @@ def _provenance(catalog_period: list[dict], enr_rows: list[dict]) -> dict:
     """ФАКТ происхождения (§3.5.1): hr_sources/device_models с долями времени и числом
     тренировок n. БЕЗ суждения о сравнимости — это LLM по факту.
 
-    unknown отдаётся как «НЕ ЗНАЮ» (Q12), не как «однородно». LLM, увидев
+    unknown отдаётся как «НЕ ЗНАЮ» (AGG-UNKNOWN-NOT-CLEAN), не как «однородно». LLM, увидев
     hr_sources={unknown:1.0}, ОБЯЗАН пометить пульсовую динамику «источник не разложен,
     сравнение через годы недостоверно» (§5.4/§1.7). Не зашиваем «unknown → сравнивать
     можно» — пустота должна быть честной, не притворяться чистотой."""
@@ -340,7 +340,7 @@ def _provenance(catalog_period: list[dict], enr_rows: list[dict]) -> dict:
         "hr_sources": {k: round(v / n, 3) for k, v in hr_src.items()},
         "device_models": {k: round(v / n, 3) for k, v in dev.items()},
         "n_activities": n,
-        # явная пометка, что источник не разложен (Q12) — чтобы LLM не принял за чистоту
+        # явная пометка, что источник не разложен (AGG-UNKNOWN-NOT-CLEAN) — чтобы LLM не принял за чистоту
         "hr_source_resolved": any(k != "unknown" for k in hr_src),
     }
 
@@ -350,7 +350,7 @@ def _provenance(catalog_period: list[dict], enr_rows: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def aggregate_profile(slug: str, db_path: str) -> dict:
-    """Весь архив → period_aggregates, строка на квартал (Q5). Один проход по enriched,
+    """Весь архив → period_aggregates, строка на квартал (AGG-PERIOD-GRANULARITY). Один проход по enriched,
     без сети, без streams массово. Возвращает сводку {period_key: счётчики}."""
     st = Store(db_path)
     try:

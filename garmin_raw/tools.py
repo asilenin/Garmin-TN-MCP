@@ -410,7 +410,7 @@ def enrich_activity(slug: str, activity_id: int) -> dict:
     Случай (а) из ТЗ enrich-flow: raw есть → пересчёт из БД (чистый CPU). Случай (б)
     (raw нет) НЕ обрабатывается здесь — возвращается структурированный отказ
     {status: "no_raw"}, НЕ тихая деградация и НЕ авто-sync (это скрытое разветвление,
-    делающее тул неклассифицируемым по оси Q4; сетевой enrich — отдельный тул, стоп
+    делающее тул неклассифицируемым по оси INV-NET-GUARD; сетевой enrich — отдельный тул, стоп
     до Q-8.1). LLM видит no_raw и решает (сетевой путь / sync), порога в коде нет.
 
     Предикат "raw есть" — ЕДИНЫЙ st.has_raw(id,'streams') (тот же, что агрегирует
@@ -479,7 +479,7 @@ def enrich_estimate(slug: str, *, start: Optional[str] = None,
                                 enrich_activity (случай (а), домен ЭТОГО тула);
       count_missing_raw       — streams НЕТ → нужен сетевой fetch (случай (б)).
 
-    ВРЕМЯ НЕ ДАЁТСЯ НИ ДЛЯ ОДНОЙ ЧАСТИ — и это НЕ недоделка (обоснование QA Q9):
+    ВРЕМЯ НЕ ДАЁТСЯ НИ ДЛЯ ОДНОЙ ЧАСТИ — и это НЕ недоделка (обоснование QA INV-NO-DOMAIN-LEAK):
       • cache-only часть: CPU-пересчёт пренебрежим; совокупность N точечных вызовов
         доминируется MCP round-trip — НЕ домен коннектора (как терпение/поведение сети).
         count_has_raw_no_enrich — количество единиц работы, не время; LLM решает по числу
@@ -492,7 +492,7 @@ def enrich_estimate(slug: str, *, start: Optional[str] = None,
       домена (cache-only тул рассуждает о сети), которую замок здесь и поймал.
 
     ЕДИНЫЙ ПРЕДИКАТ: st.count_enrich_pending — тот же критерий, что has_raw/has_enriched
-    у enrich_activity (Q8). Будущий сетевой estimate ОБЯЗАН агрегировать ТОТ ЖЕ
+    у enrich_activity (TOOL-READ-NET-SPLIT). Будущий сетевой estimate ОБЯЗАН агрегировать ТОТ ЖЕ
     count_enrich_pending для count_missing_raw, не свой скан (иначе разъезд, как has_raw).
     Согласованность — страж test_enrich.
     """

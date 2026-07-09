@@ -1,6 +1,6 @@
 """Интеграционный тест 8a+8a.1: add_lactate (три формы входа + якорная конвертация),
 add_note/delete, recompute_user_marks, мёрж в compact/full, + замок профиль-
-нейтральности возврата (I2/Q4 7.5). Штатный интеграционный тест репо: самодостаточен
+нейтральности возврата (I2/INV-KEY-HIDDEN 7.5). Штатный интеграционный тест репо: самодостаточен
 (temp-БД, синтетика), путь к модулям от __file__ — бежит из любого cwd и в CI."""
 import os, tempfile, sys, json
 import numpy as np
@@ -116,7 +116,7 @@ assert tools.delete_lactate(SLUG, first)["deleted"] is True
 print("G delete OK")
 
 # --- 7.6-2(a): hr_source/device_model в compact/full — условная эмиссия ---
-# Три состояния каталога (Q12/Q15): значение ('chest'/'unknown') / NULL (не посчитано).
+# Три состояния каталога (AGG-UNKNOWN-NOT-CLEAN/PROV-HR-SOURCE-EXTRACT): значение ('chest'/'unknown') / NULL (не посчитано).
 # unknown — ЗНАЧЕНИЕ («не знаю» как факт), NULL — отсутствие ключа. Не схлопывать.
 with Store(prof.db_path) as st:
     st.conn.execute("UPDATE activities SET hr_source='unknown', device_model='3350970362', "
@@ -168,14 +168,14 @@ with Store(prof.db_path) as st:
     assert r5["avg_hr_raw"] == 151, dict(r5)           # summary-owned обновился
 print("J 7.6-2a': upsert не трогает enrich-owned, INSERT несёт сид OK")
 
-# --- ЗАМОК профиль-нейтральности возврата (I2 / QA 7.5 Q4) ---
+# --- ЗАМОК профиль-нейтральности возврата (I2 / QA 7.5 INV-KEY-HIDDEN) ---
 # slug виден функции, невидим модели. Модель видит ВОЗВРАТ семи функций этапа 7 →
 # в нём не должно быть ни имён-ключей профиля, ни значений (путей/slug) этого профиля.
 # Страж при функциях (бежит при каждом изменении tools.py), не разовая приёмка обёртки.
 _KEY_BLACKLIST = {"slug", "db_path", "profile", "tokens_dir", "base", "state_path"}
 
 def assert_profile_neutral(result, resolved):
-    """Два инварианта, РАЗНЫЙ способ для путей и slug (Q4):
+    """Два инварианта, РАЗНЫЙ способ для путей и slug (INV-KEY-HIDDEN):
       1. ни один КЛЮЧ (рекурсивно) не из чёрного списка имён;
       2. ПУТИ (db_path/tokens_dir/base) — подстрокой в любом строковом листе
          (путь в тексте = всегда утечка, в данных активности легитимно не появится);

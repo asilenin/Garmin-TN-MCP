@@ -2,10 +2,10 @@
 
 Покрывает то, что проверяемо БЕЗ реальной сети:
   (1) cache-hit-до-Fetcher: полный валидный кэш под forbid_network → сеть НЕ тронута
-      (Q4-требование placement: cache-hit возвращается до создания Fetcher);
+      (INV-NET-GUARD-требование placement: cache-hit возвращается до создания Fetcher);
   (2) per-зонд degradation: ok/empty/error в кэше отдаются раздельно, отсутствие
       строки = зонд не в ответе;
-  (3) derived-пометка: body_battery/stress несут derived_fields (не резаны, Q6);
+  (3) derived-пометка: body_battery/stress несут derived_fields (не резаны, WELL-FRESHNESS-LLM);
   (4) возраст даты как факт свежести (requested_at_age_days).
 
 ЖИВАЯ часть (у владельца, с токенами) — ОТДЕЛЬНО (test_wellness_live через сокет-
@@ -68,7 +68,7 @@ def test_per_probe_degradation() -> None:
 
 
 def test_derived_marked() -> None:
-    """(3) derived-поля помечены (не резаны, Q6 разв. C)."""
+    """(3) derived-поля помечены (не резаны, WELL-FRESHNESS-LLM разв. C)."""
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)
     assert res["probes"]["body_battery"]["derived_fields"], "body_battery без derived-пометки"
@@ -78,7 +78,7 @@ def test_derived_marked() -> None:
 
 
 def test_age_days_fact() -> None:
-    """(4) возраст даты — факт свежести для LLM (Q6), не суждение в коде."""
+    """(4) возраст даты — факт свежести для LLM (WELL-FRESHNESS-LLM), не суждение в коде."""
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)
     assert "requested_at_age_days" in res

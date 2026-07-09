@@ -218,7 +218,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
         --
         -- at_time — wall-clock UTC (мс epoch), НЕ elapsed-moving: замер лактата часто
         -- в ПАУЗЕ после рабочего куска (человек остановился, уколол палец). elapsed-
-        -- moving выкинул бы точку паузы (та же логика, что hr_recovery Q8: края по
+        -- moving выкинул бы точку паузы (та же логика, что hr_recovery INV-ROBUST-EXTREME: края по
         -- wall-clock, moving-маска убрала бы измеряемую точку). Согласовано с потоком
         -- (directTimestamp — wall-clock мс) и lap bounds (startTimeGMT UTC).
         -- ─────────────────────────────────────────────────────────────────────
@@ -310,7 +310,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
         -- дату. НОВАЯ таблица (CREATE), НЕ трогает activity_raw/activities/enriched/
         -- user_data — аддитивна, как v4. Существующие данные не затрагиваются.
         --
-        -- ОТДЕЛЬНЫЙ КЛАСС ДАННЫХ, не сырьё (QA 7.6 Q6). activity_raw живёт по инварианту
+        -- ОТДЕЛЬНЫЙ КЛАСС ДАННЫХ, не сырьё (QA 7.6 WELL-FRESHNESS-LLM). activity_raw живёт по инварианту
         -- «прошлое неизменно → кэш навечно». Wellness Garmin ПЕРЕСЧИТЫВАЕТ задним числом
         -- (ночь дописывается утром, HRV-статус ре-калибруется на 7-дневном окне) →
         -- инвариант неприменим ПО ПРИРОДЕ данных. Отсюда fetched_at обязателен как факт
@@ -341,7 +341,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
         -- — суждение LLM «перекачивать ли», не факт схемы → не четвёртый статус, а деталь.
         --
         -- payload — сжатый zlib JSON (как activity_raw), полный набор зонда БЕЗ резки
-        -- полей (Q6 разв. C: body_battery/stress derived — сигналы состояния для LLM,
+        -- полей (WELL-FRESHNESS-LLM разв. C: body_battery/stress derived — сигналы состояния для LLM,
         -- не «чужая классификация тренировки» §0; резать в коде = зашить суждение).
         -- PII: в теле пяти зондов персональных данных НЕТ (probe-дамп проверен глазами +
         -- скан паттернов), userProfileId только в URL — URL НЕ хранится. deviceId в
@@ -448,11 +448,11 @@ class Store:
     # уточнённые значения сидами из summary — wipe, стерший hr_source на живых БД).
     # INSERT-ветка сиды сохраняет (новая строка живёт с ними до обогащения).
     # Критерий владения — источник истины колонки:
-    #   hr_source        — только из потока (Q15), summary не знает;
+    #   hr_source        — только из потока (PROV-HR-SOURCE-EXTRACT), summary не знает;
     #   moving_time_s    — свой расчёт enrich (§1.5), movingDuration — лишь сид;
     #   max_hr           — 99-й перцентиль enrich (§2.4), maxHR summary — лишь сид;
     #   gps_validated / gps_type / biomech_source — извлечение назначено enrich-слою
-    #   контрактом Q12/ТЗ (версионируемо, из сырья) — исключены заранее, чтобы
+    #   контрактом AGG-UNKNOWN-NOT-CLEAN/ТЗ (версионируемо, из сырья) — исключены заранее, чтобы
     #   T7.6-2(b) не наступил на тот же wipe; сейчас NULL с обеих сторон, безвредно.
     _ENRICH_OWNED_ACT_COLS = frozenset({
         "hr_source", "moving_time_s", "max_hr",
@@ -506,7 +506,7 @@ class Store:
         payload (битый streams при наличии строки → has_raw_no_enrich, тул вернёт error
         при пересчёте, НЕ no_raw — это верно по предикату). Согласованность с
         has_raw/has_enriched проверяется стражем test_enrich (поведение, не текст SQL —
-        текстовая константа не ловит структурный разъезд, ср. upsert INSERT/UPDATE Q2).
+        текстовая константа не ловит структурный разъезд, ср. upsert INSERT/UPDATE INV-ENRICH-OWNED-COLS).
         """
         clauses, params = ["1=1"], []
         if start:

@@ -125,7 +125,7 @@ def _parse_tn_args(argv: list[str]) -> tuple[str, str | None, str | None]:
 
 def install_tn() -> None:
     """Профильный enriched-коннектор в конфиг Claude. Ключ garmin-tn-<slug>, env
-    GARMIN_TN_PROFILE=<slug> (профиль выбирается транспортом, не моделью — QA 7.5 Q1).
+    GARMIN_TN_PROFILE=<slug> (профиль выбирается транспортом, не моделью — QA 7.5 CI-PROVIDER-BY-TRANSPORT).
     GARMIN_TOKENSTORE — ТОЛЬКО по флагу --tokenstore (не дефолт: хардкод личного пути
     заглушил бы диагностику 'профиль не настроен' на чужой машине)."""
     try:                       # install — пакетный entry (from .), тест — флэт (import)
