@@ -58,7 +58,8 @@ uv run python garmin_raw/sync.py <slug> enrich 50     # enrichment + streams, ne
 uv run python garmin_raw/sync.py <slug> fetch-aux     # laps + comments (lactate)
 ```
 
-`<slug>` is a short profile name (`anton`, `mila`, letters/digits). With years
+`<slug>` is the connection key `<provider>-<user>` (e.g. `garmin-anton`,
+`garmin-mila`; letters/digits/`-`). With years
 of history, run `enrich` in batches (`enrich 100`, then again) — it skips
 what's already enriched. **On a large archive, first enrichment can take over
 an hour** — expected, Garmin has no bulk endpoint for per-second streams.
@@ -72,14 +73,16 @@ uv run python garmin_raw/sync.py <slug> status
 ### 3. Connect to Claude Desktop
 
 ```bash
-uv run garmin-tn-install <slug>
+uv run tn-install <provider> <user>
 ```
 
-Appends a `garmin-tn-<slug>` connector to `claude_desktop_config.json` without
-touching anything else (backs up before writing). Repo path is auto-detected;
-pass it explicitly if needed: `uv run garmin-tn-install <slug> /full/path/to/repo`.
+A **connection** is `(provider, user)` — e.g. `garmin anton`. Appends a
+`tn-<provider>-<user>` connector (e.g. `tn-garmin-anton`) to
+`claude_desktop_config.json` without touching anything else (backs up before
+writing), with env `TN_USER`/`TN_PROVIDER`. Repo path is auto-detected; pass it
+explicitly if needed: `uv run tn-install <provider> <user> /full/path/to/repo`.
 
-Restart Claude Desktop (Cmd+Q on macOS — not just closing the window) — 8
+Restart Claude Desktop (Cmd+Q on macOS — not just closing the window) — 15
 `garmin_*` tools will appear.
 
 ## Multiple profiles (different Garmin accounts)
@@ -88,15 +91,16 @@ Example: your own account plus a training partner's.
 
 ```bash
 # for the account authenticated via garmin-raw-auth above — reuse its tokens:
-uv run garmin-tn-install anton --tokenstore ~/.garminconnect
+uv run tn-install garmin anton --tokenstore ~/.garminconnect
 
-# for a second account — authenticate separately into its own token folder:
-mkdir -p ~/.garmin-tn/profiles/mila/tokens
-GARMIN_TOKENSTORE=~/.garmin-tn/profiles/mila/tokens uv run garmin-raw-auth
-uv run python garmin_raw/sync.py mila
-uv run python garmin_raw/sync.py mila enrich 50
-uv run python garmin_raw/sync.py mila fetch-aux
-uv run garmin-tn-install mila
+# for a second account — authenticate separately into its own token folder
+# (connection slug = <provider>-<user>, e.g. garmin-mila):
+mkdir -p ~/.garmin-tn/profiles/garmin-mila/tokens
+GARMIN_TOKENSTORE=~/.garmin-tn/profiles/garmin-mila/tokens uv run garmin-raw-auth
+uv run python garmin_raw/sync.py garmin-mila
+uv run python garmin_raw/sync.py garmin-mila enrich 50
+uv run python garmin_raw/sync.py garmin-mila fetch-aux
+uv run tn-install garmin mila
 ```
 
 `--tokenstore` is needed **only if** the profile has no token folder of its
@@ -147,7 +151,7 @@ after a code update if the computation logic changed; no network needed).
 ## Uninstalling
 
 ```bash
-uv run garmin-tn-uninstall <slug>        # remove one profile connector
+uv run tn-uninstall <provider> <user>    # remove one connection connector
 uv run garmin-raw-uninstall              # remove the raw connector (if installed)
 ```
 
