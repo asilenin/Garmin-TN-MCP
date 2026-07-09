@@ -4,10 +4,10 @@
   A. install_tn пишет корректный per-slug конфиг (env, merge-safe, идемпотентно,
      сырьевой garmin-raw цел) + предупреждение при профиле без токенов и без --tokenstore.
   B. entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ: garmin-tn-mcp БЕЗ env → быстрый ненулевой exit с нашим
-     текстом про GARMIN_TN_PROFILE. Не резолвится (нет в PATH) → SKIP с инструкцией.
+     текстом про TN_USER/подключение. Не резолвится (нет в PATH) → SKIP с инструкцией.
      Резолвится, но не наш текст → КРАСНЫЙ (entry указывает не туда). Таймаут → КРАСНЫЙ
      (CI-PROVIDER-BY-TRANSPORT-падение должно быть ДО mcp.run(), без stdio-лупа).
-  C. MCP handshake: initialize + tools/list → 8 тулов garmin_*, slug НЕ в inputSchema.
+  C. MCP handshake: initialize + tools/list → 15 тулов garmin_*, slug НЕ в inputSchema.
      Через module-invocation (всегда доступно), чтобы проверять поверхность даже без
      установленного entry; таймаут+stderr против немого висяка.
 Приёмка (2) — «Claude Desktop видит два коннектора» — ручная, в бою; НЕ здесь (нельзя
@@ -31,6 +31,9 @@ sys.path.insert(0, str(_ROOT / "garmin_raw"))
 _EXPECTED_TOOLS = {
     "garmin_status", "garmin_query", "garmin_compact", "garmin_full",
     "garmin_aggregates", "garmin_add_lactate", "garmin_add_note", "garmin_delete_mark",
+    "garmin_wellness", "garmin_enrich_activity", "garmin_enrich_estimate",
+    "garmin_sync_catalog", "garmin_sync_estimate", "garmin_enrich_fetch",
+    "garmin_enrich_fetch_estimate",
 }
 
 
@@ -50,13 +53,13 @@ def test_install_config():
     profiles.ROOT = Path(tmp)                # чтобы warn-проверка смотрела в temp
 
     # установка с --tokenstore → env содержит оба ключа, сырьевой и userPref целы
-    sys.argv = ["garmin-tn-install", "anton", str(_ROOT), "--tokenstore", "/tok/store"]
+    sys.argv = ["tn-install", "garmin", "anton", str(_ROOT), "--tokenstore", "/tok/store"]
     out = io.StringIO()
     with redirect_stdout(out):
         inst.install_tn()
     data = json.loads(cfg.read_text())
-    srv = data["mcpServers"]["garmin-tn-anton"]
-    assert srv["env"] == {"GARMIN_TN_PROFILE": "anton", "GARMIN_TOKENSTORE": "/tok/store"}
+    srv = data["mcpServers"]["tn-garmin-anton"]
+    assert srv["env"] == {"TN_USER": "anton", "TN_PROVIDER": "garmin", "GARMIN_TOKENSTORE": "/tok/store"}
     assert srv["args"] == ["--directory", str(_ROOT), "run", "garmin-tn-mcp"]
     assert "garmin-raw" in data["mcpServers"], "сырьевой коннектор затронут!"
     assert data["userPref"] == "keep-me", "merge не сохранил чужие ключи!"
@@ -65,17 +68,17 @@ def test_install_config():
     # идемпотентность: повторная установка не плодит, ключ один
     inst.install_tn()
     data = json.loads(cfg.read_text())
-    assert list(data["mcpServers"]).count("garmin-tn-anton") == 1
+    assert list(data["mcpServers"]).count("tn-garmin-anton") == 1
 
     # второй профиль — оба сосуществуют, сырьевой цел
-    sys.argv = ["garmin-tn-install", "mila", str(_ROOT), "--tokenstore", "/tok/mila"]
+    sys.argv = ["tn-install", "garmin", "mila", str(_ROOT), "--tokenstore", "/tok/mila"]
     with redirect_stdout(io.StringIO()):
         inst.install_tn()
     data = json.loads(cfg.read_text())
-    assert {"garmin-raw", "garmin-tn-anton", "garmin-tn-mila"} <= set(data["mcpServers"])
+    assert {"garmin-raw", "tn-garmin-anton", "tn-garmin-mila"} <= set(data["mcpServers"])
 
     # предупреждение: профиль без своих токенов И без --tokenstore
-    sys.argv = ["garmin-tn-install", "bob", str(_ROOT)]
+    sys.argv = ["tn-install", "garmin", "bob", str(_ROOT)]
     out = io.StringIO()
     with redirect_stdout(out):
         inst.install_tn()
@@ -83,18 +86,19 @@ def test_install_config():
         "нет предупреждения о профиле без токенов"
 
     # uninstall убирает только свой ключ, сырьевой и другие профили целы
-    sys.argv = ["garmin-tn-uninstall", "anton"]
+    sys.argv = ["tn-uninstall", "garmin", "anton"]
     with redirect_stdout(io.StringIO()):
         inst.uninstall_tn()
     data = json.loads(cfg.read_text())
-    assert "garmin-tn-anton" not in data["mcpServers"]
-    assert {"garmin-raw", "garmin-tn-mila"} <= set(data["mcpServers"])
-    print("A install-конфиг: per-slug env, merge-safe, идемпотент, warn, uninstall ✓")
+    assert "tn-garmin-anton" not in data["mcpServers"]
+    assert {"garmin-raw", "tn-garmin-mila"} <= set(data["mcpServers"])
+    print("A install-конфиг: per-connection env, merge-safe, идемпотент, warn, uninstall ✓")
 
 
 # ── B. entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ ────────────────────────────────────────────
 def test_entry_resolves_via_q7():
-    env = {k: v for k, v in os.environ.items() if k != "GARMIN_TN_PROFILE"}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TN_USER", "TN_PROVIDER", "GARMIN_TN_PROFILE")}
     try:
         p = subprocess.run(["garmin-tn-mcp"], capture_output=True, text=True,
                            timeout=15, env=env)
@@ -106,7 +110,7 @@ def test_entry_resolves_via_q7():
         raise AssertionError("garmin-tn-mcp БЕЗ профиля завис — CI-PROVIDER-BY-TRANSPORT-падение должно быть "
                              "ДО mcp.run() (регресс порядка в main()?)")
     assert p.returncode != 0, f"без профиля должен упасть (CI-PROVIDER-BY-TRANSPORT); rc={p.returncode}"
-    assert "GARMIN_TN_PROFILE" in p.stderr, (
+    assert "TN_USER" in p.stderr or "Подключение" in p.stderr, (
         f"резолвится, но stderr не наш CI-PROVIDER-BY-TRANSPORT-текст — entry указывает не туда?\n"
         f"rc={p.returncode} stderr={p.stderr!r}")
     print("B entry-резолв через CI-PROVIDER-BY-TRANSPORT-отказ ✓")
@@ -127,7 +131,7 @@ async def _list_tools(env, cwd):
 
 def test_mcp_handshake():
     tmp = tempfile.mkdtemp()
-    env = {**os.environ, "GARMIN_TN_PROFILE": "testp", "GARMIN_TN_HOME": tmp,
+    env = {**os.environ, "TN_USER": "testp", "TN_PROVIDER": "garmin", "GARMIN_TN_HOME": tmp,
            "PYTHONPATH": str(_ROOT)}
     try:
         tools = asyncio.run(asyncio.wait_for(_list_tools(env, _ROOT), timeout=25))

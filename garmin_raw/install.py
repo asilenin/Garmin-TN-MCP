@@ -105,8 +105,8 @@ def _repo_from(repo_arg: str | None) -> Path:
     return repo
 
 
-def _parse_tn_args(argv: list[str]) -> tuple[str, str | None, str | None]:
-    """<slug> [repo] [--tokenstore PATH]. Возвращает (slug, repo|None, tokenstore|None)."""
+def _parse_tn_args(argv: list[str]) -> tuple[str, str, str | None, str | None]:
+    """<provider> <user> [repo] [--tokenstore PATH]. → (provider, user, repo|None, tokenstore|None)."""
     args, positional, tokenstore = argv[1:], [], None
     i = 0
     while i < len(args):
@@ -118,27 +118,31 @@ def _parse_tn_args(argv: list[str]) -> tuple[str, str | None, str | None]:
         else:
             positional.append(args[i])
         i += 1
-    if not positional:
-        sys.exit("Использование: garmin-tn-install <slug> [repo] [--tokenstore PATH]")
-    return positional[0], (positional[1] if len(positional) > 1 else None), tokenstore
+    if len(positional) < 2:
+        sys.exit("Использование: tn-install <provider> <user> [repo] [--tokenstore PATH]\n"
+                 "  напр. tn-install garmin anton --tokenstore ~/.garminconnect")
+    return (positional[0], positional[1],
+            (positional[2] if len(positional) > 2 else None), tokenstore)
 
 
 def install_tn() -> None:
-    """Профильный enriched-коннектор в конфиг Claude. Ключ garmin-tn-<slug>, env
-    GARMIN_TN_PROFILE=<slug> (профиль выбирается транспортом, не моделью — QA 7.5 CI-PROVIDER-BY-TRANSPORT).
-    GARMIN_TOKENSTORE — ТОЛЬКО по флагу --tokenstore (не дефолт: хардкод личного пути
-    заглушил бы диагностику 'профиль не настроен' на чужой машине)."""
+    """Enriched-коннектор в конфиг Claude. Ключ tn-<provider>-<user>, env TN_USER/TN_PROVIDER
+    (подключение выбирается транспортом, не моделью — CI-PROVIDER-BY-TRANSPORT). slug =
+    <provider>-<user> (build_slug). GARMIN_TOKENSTORE — ТОЛЬКО по флагу --tokenstore (не дефолт:
+    хардкод личного пути заглушил бы диагностику 'подключение не настроено' на чужой машине)."""
     try:                       # install — пакетный entry (from .), тест — флэт (import)
         from . import profiles
     except ImportError:
         import profiles
 
-    slug, repo_arg, tokenstore = _parse_tn_args(sys.argv)
-    if not profiles._valid_slug(slug):
-        sys.exit(f"Недопустимый slug {slug!r}: [a-z0-9_-], начинается с буквы/цифры.")
+    provider, user, repo_arg, tokenstore = _parse_tn_args(sys.argv)
+    try:
+        slug = profiles.build_slug(user, provider)
+    except ValueError as e:
+        sys.exit(str(e))
     cfg, repo, uv = _config_path(), _repo_from(repo_arg), _uv_bin()
-    key = f"garmin-tn-{slug}"
-    env = {"GARMIN_TN_PROFILE": slug}
+    key = f"tn-{slug}"
+    env = {"TN_USER": user, "TN_PROVIDER": provider}
     if tokenstore:
         env["GARMIN_TOKENSTORE"] = str(Path(tokenstore).expanduser())
 
@@ -166,11 +170,11 @@ def install_tn() -> None:
 
 
 def uninstall_tn() -> None:
-    """Убрать профильный enriched-коннектор garmin-tn-<slug>. Сырьевой garmin-raw и
-    другие профили не трогаются."""
-    slug, _, _ = _parse_tn_args(sys.argv)
+    """Убрать enriched-коннектор tn-<provider>-<user>. Сырьевой garmin-raw и другие
+    подключения не трогаются."""
+    provider, user, _, _ = _parse_tn_args(sys.argv)
     cfg = _config_path()
-    key = f"garmin-tn-{slug}"
+    key = f"tn-{provider}-{user}"
     data = _load(cfg)
     if data.get("mcpServers", {}).pop(key, None) is None:
         print(f"'{key}' не найден в {cfg} — нечего удалять.")

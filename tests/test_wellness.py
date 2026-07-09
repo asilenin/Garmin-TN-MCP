@@ -16,6 +16,7 @@
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "garmin_raw"))
@@ -43,11 +44,21 @@ def _seed_full_cache() -> None:
         st.put_wellness_probe(DATE, "body_battery", "error", detail="429 rate limit")
 
 
+def _pin_and_seed() -> None:
+    """Порядко-независимость: пиннит profiles.ROOT к своему tmp (другие тест-файлы
+    мутируют глобал и НЕ восстанавливают — кросс-тестовая протечка), пере-резолвит prof
+    и сеет кэш. Вызывается в начале каждого теста."""
+    global prof
+    profiles.ROOT = Path(tmp)
+    prof = profiles.resolve(SLUG); prof.ensure_dirs()
+    _seed_full_cache()
+
+
 def test_cache_hit_no_network() -> None:
     """(1) Полный кэш (все 5 зондов есть строкой) под forbid_network → сеть НЕ тронута.
     Ключевой тест placement: garmin_wellness видит, что качать нечего, и НЕ создаёт
     Fetcher (иначе ленивый login полез бы в сокет)."""
-    _seed_full_cache()
+    _pin_and_seed()
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)   # refresh=False, все зонды в кэше
     assert res["date"] == DATE
@@ -57,6 +68,7 @@ def test_cache_hit_no_network() -> None:
 
 def test_per_probe_degradation() -> None:
     """(2) ok/empty/error отдаются раздельно, payload только у ok."""
+    _pin_and_seed()
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)
     p = res["probes"]
@@ -69,6 +81,7 @@ def test_per_probe_degradation() -> None:
 
 def test_derived_marked() -> None:
     """(3) derived-поля помечены (не резаны, WELL-FRESHNESS-LLM разв. C)."""
+    _pin_and_seed()
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)
     assert res["probes"]["body_battery"]["derived_fields"], "body_battery без derived-пометки"
@@ -79,6 +92,7 @@ def test_derived_marked() -> None:
 
 def test_age_days_fact() -> None:
     """(4) возраст даты — факт свежести для LLM (WELL-FRESHNESS-LLM), не суждение в коде."""
+    _pin_and_seed()
     with forbid_network():
         res = net_tools.garmin_wellness(SLUG, DATE)
     assert "requested_at_age_days" in res
@@ -92,6 +106,7 @@ def test_login_fail_blocked_by_auth() -> None:
     получают blocked_by_auth В ВОЗВРАТЕ (не в кэше), + login_error с reauth-сообщением.
     Ключевое: login-сбой НЕ маскируется под пять зондовых error и НЕ пишется в кэш.
     Проверяет разведение login-фазы от зонд-фазы."""
+    _pin_and_seed()
     empty_date = "2025-01-15"   # нет строк в кэше → все 5 в to_fetch
     with Store(prof.db_path) as st:
         assert st.get_wellness_date(empty_date) == {}, "дата должна быть пустой"

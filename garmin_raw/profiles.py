@@ -12,9 +12,10 @@
         cache.db                   # SQLite профиля
         state.json                 # last_sync, policy, algo_version, range (зеркало meta)
 
-Выбор профиля процессом — через окружение:
-    GARMIN_TN_PROFILE   slug; из него резолвятся все пути
-    GARMIN_TOKENSTORE   (legacy) явный путь к токенам, переопределяет tokens/
+Выбор подключения процессом — через окружение (CI-PROVIDER-BY-TRANSPORT):
+    TN_USER / TN_PROVIDER   подключение = (user, provider); slug = <provider>-<user>
+    GARMIN_TN_PROFILE       (legacy) bare user, provider=garmin (обратная совместимость)
+    GARMIN_TOKENSTORE       (legacy) явный путь к токенам, переопределяет tokens/
 """
 from __future__ import annotations
 
@@ -34,6 +35,22 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 def _valid_slug(slug: str) -> bool:
     return bool(_SLUG_RE.match(slug))
+
+
+_DEFAULT_PROVIDER = "garmin"
+
+
+def build_slug(user: str, provider: str | None = None) -> str:
+    """Ключ подключения <provider>-<user>. provider дефолтит в garmin. Валидирует обе части.
+    slug — непрозрачный ключ-каталог (обратно в (provider,user) не парсится → дефис внутри
+    user безопасен: provider/user несёт env раздельно)."""
+    provider = (provider or _DEFAULT_PROVIDER).strip().lower()
+    user = (user or "").strip()
+    if not _valid_slug(provider):
+        raise ValueError(f"Недопустимый provider {provider!r}: [a-z0-9_-], с буквы/цифры.")
+    if not _valid_slug(user):
+        raise ValueError(f"Недопустимый user {user!r}: [a-z0-9_-], с буквы/цифры.")
+    return f"{provider}-{user}"
 
 
 @dataclass(frozen=True)
@@ -81,14 +98,22 @@ def resolve(slug: str) -> Profile:
 
 
 def current_slug() -> str:
-    """Slug из окружения. Пусто → ошибка с понятной подсказкой."""
-    slug = os.environ.get("GARMIN_TN_PROFILE")
-    if not slug:
-        raise RuntimeError(
-            "GARMIN_TN_PROFILE не задан. Укажите профиль: "
-            "`GARMIN_TN_PROFILE=<slug> ...` или создайте его `garmin-tn-init <slug>`."
-        )
-    return slug
+    """Slug подключения из окружения: <provider>-<user>.
+
+    Приоритет: TN_USER (+ TN_PROVIDER, дефолт garmin) → legacy GARMIN_TN_PROFILE (bare user,
+    provider=garmin) → ошибка. Legacy-фолбэк держит живые Garmin-коннекторы рабочими после
+    миграции раскладки на profiles/<provider>-<user>/ (CI-PROVIDER-BY-TRANSPORT)."""
+    user = os.environ.get("TN_USER")
+    if user:
+        return build_slug(user, os.environ.get("TN_PROVIDER"))
+    legacy = os.environ.get("GARMIN_TN_PROFILE")
+    if legacy:
+        return build_slug(legacy, _DEFAULT_PROVIDER)
+    raise RuntimeError(
+        "Подключение не задано. Укажите TN_USER (+опц. TN_PROVIDER, дефолт garmin) в env "
+        "коннектора, напр. TN_USER=anton TN_PROVIDER=garmin. Legacy GARMIN_TN_PROFILE=<user> "
+        "тоже принимается (provider=garmin)."
+    )
 
 
 def current() -> Profile:
@@ -178,6 +203,18 @@ if __name__ == "__main__":
             del os.environ["GARMIN_TOKENSTORE"]
             p = P.resolve("carol")
             assert p.tokens_dir == Path(d) / "profiles" / "carol" / "tokens", p.tokens_dir
+
+            # (5) build_slug / current_slug: TN_USER+TN_PROVIDER, legacy fallback
+            assert P.build_slug("anton") == "garmin-anton"
+            assert P.build_slug("andrey", "coros") == "coros-andrey"
+            for k in ("TN_USER", "TN_PROVIDER"):
+                os.environ.pop(k, None)
+            os.environ["GARMIN_TN_PROFILE"] = "mila"
+            assert P.current_slug() == "garmin-mila", "legacy → garmin-<user>"
+            os.environ["TN_USER"] = "andrey"; os.environ["TN_PROVIDER"] = "coros"
+            assert P.current_slug() == "coros-andrey", "новый env перебивает legacy"
+            for k in ("TN_USER", "TN_PROVIDER", "GARMIN_TN_PROFILE"):
+                os.environ.pop(k, None)
         print("profiles self-test OK")
         sys.exit(0)
     # быстрый осмотр: что зарегистрировано и куда резолвится

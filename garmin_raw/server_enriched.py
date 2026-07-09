@@ -1,6 +1,6 @@
 """MCP-сервер обогащённого слоя (этап 7.5): compact/full/query/aggregates/status +
 add_lactate/add_note/delete через MCP. Профиль-aware по схеме (B): ОДИН коннектор =
-ОДИН профиль, slug из env GARMIN_TN_PROFILE при старте — НЕ параметр тула.
+ОДНО подключение, slug из env TN_USER/TN_PROVIDER при старте (legacy GARMIN_TN_PROFILE) — НЕ параметр тула.
 
 Инварианты (QA 7.5):
 - I1: профиль выбирается транспортом (какой коннектор), не моделью. slug из env.
@@ -10,7 +10,7 @@ add_lactate/add_note/delete через MCP. Профиль-aware по схеме
 - I4: cache-only — тул в сеть не ходит (закачка сырья = sync CLI).
 - I5: тонкая обёртка — функции tools.py не переписываются, адаптер подставляет env-slug.
 
-Запуск: GARMIN_TN_PROFILE=<slug> garmin-tn-mcp (stdio). Без профиля — падение при старте
+Запуск: TN_USER=<user> TN_PROVIDER=<provider> garmin-tn-mcp (stdio). Без подключения — падение при старте
 (молчаливый дефолт = профиль-угадывание, запрещено I1).
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+import profiles  # noqa: E402
 import tools  # noqa: E402
 import net_tools  # noqa: E402  (сетевые тулы: wellness, sync_catalog)
 
@@ -39,7 +40,7 @@ def _slug() -> str:
     if _SLUG is None:
         # защитно: тул вызван до инициализации (не должно случаться — mcp.run() в main
         # после установки). Не подставляем дефолт (I1: угадывание запрещено).
-        raise RuntimeError("профиль не инициализирован (GARMIN_TN_PROFILE)")
+        raise RuntimeError("подключение не инициализировано (TN_USER/TN_PROVIDER)")
     return _SLUG
 
 
@@ -180,12 +181,10 @@ def garmin_enrich_fetch_estimate(start: str | None = None, end: str | None = Non
 
 def main() -> None:
     global _SLUG
-    _SLUG = os.environ.get("GARMIN_TN_PROFILE")
-    if not _SLUG:
-        raise SystemExit(
-            "GARMIN_TN_PROFILE не задан. Enriched-сервер профиль-aware: один коннектор =\n"
-            "один профиль. Укажите профиль в env коннектора, напр. GARMIN_TN_PROFILE=anton."
-        )
+    try:
+        _SLUG = profiles.current_slug()   # TN_USER/TN_PROVIDER → <provider>-<user> (+legacy)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
     mcp.run()
 
 
@@ -260,12 +259,13 @@ if __name__ == "__main__":
             garmin_status(); assert False, "должно упасть без профиля"
         except RuntimeError:
             pass
-        os.environ.pop("GARMIN_TN_PROFILE", None)
+        for _k in ("TN_USER", "TN_PROVIDER", "GARMIN_TN_PROFILE"):
+            os.environ.pop(_k, None)
         try:
             main(); assert False, "main без env должен SystemExit"
         except SystemExit:
             pass
-        print("5 падение без GARMIN_TN_PROFILE ✓")
+        print("5 падение без env подключения ✓")
         print("server_enriched self-test OK")
         sys.exit(0)
     main()
