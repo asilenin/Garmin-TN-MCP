@@ -22,7 +22,7 @@ import re
 from typing import Any, Optional
 
 import profiles
-from enrich import histogram_shape
+from enrich import histogram_shape, lap_series, bind_lactate_work_context
 from store import Store
 
 
@@ -184,6 +184,8 @@ def get_activity_full(slug: str, activity_id: int) -> dict:
         enr = _load_enriched(st, slug, activity_id)
         av = st.meta_get("algo_version")
         user_marks = st.get_user_marks_resolved(activity_id, av or "")
+        laps_raw = st.get_raw(activity_id, "laps")        # покруговой лог на лету (D3)
+        stream_raw = st.get_raw(activity_id, "streams")
     if enr is None:
         base = {**cat, "enriched": False}
         if user_marks:
@@ -193,6 +195,14 @@ def get_activity_full(slug: str, activity_id: int) -> dict:
     out = {**cat, "enriched": True, **enr}
     if user_marks:
         out["user_marks"] = user_marks
+    # LAP-LOG на лету (D3: не храним — дёшево из laps+streams для ОДНОЙ активности;
+    # единый helper _lap_series, тот же, что позже кормит hr_recovery — корень 2.1).
+    series = lap_series(laps_raw, stream_raw)
+    if series:
+        out["laps"] = series
+        lm = out.get("lactate_marks")
+        if isinstance(lm, dict) and lm.get("from_watch"):
+            bind_lactate_work_context(lm["from_watch"], series)   # D2: work-ref факты
     return out
 
 

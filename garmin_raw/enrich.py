@@ -731,6 +731,150 @@ def _lactate_from_watch(lact_points: list[dict], ts: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# Покруговой лог (LAP-LOG) — D5-helper: ЕДИНЫЙ источник нарезки кругов.
+# Темп круга = work_pace_core (moving-медиана ЯДРА из streams в окне круга), НЕ
+# 1000/avgSpeed всего круга (тот включает разгон/торможение → расхождение с
+# pace_histogram, корень 2.1). Таймстампы — из startTimeGMT (истинные), fallback —
+# накопление duration от ts[0]. Один предикат «какой круг work» → одна реализация
+# (has_raw-дисциплина): и hr_recovery, и garmin_full кормятся отсюда.
+# --------------------------------------------------------------------------- #
+LAP_WORK_FRAC = 0.97          # work = быстрее медианы кругов на 3% (как hr_recovery)
+LAP_HR_END_WINDOW_S = 8.0     # окно медианы hr в конце круга (для hr_end/recovery)
+
+
+def _gmt_ms(s) -> Optional[int]:
+    """startTimeGMT ('YYYY-MM-DD HH:MM:SS'/ISO) → эпоха-мс UTC. None при непарсинге."""
+    if not s:
+        return None
+    from datetime import datetime, timezone
+    tt = str(s).strip().replace("T", " ")
+    if "." in tt:
+        tt = tt.split(".", 1)[0]
+    try:
+        return int(datetime.strptime(tt, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask) -> list:
+    """Упорядоченный лог кругов. Чистая функция от laps + распарсенных streams.
+    type: work (быстрее медианы) / recovery (не-work сразу после work) / other."""
+    lap_list = (laps or {}).get("lapDTOs") or []
+    if len(lap_list) < 1 or ts.size == 0:
+        return []
+    t0 = float(ts[0])
+    cursor = t0
+    valid = []   # (start_ms, end_ms, dur_s, dist_m, lp)
+    for lp in lap_list:
+        dur = lp.get("duration") or lp.get("movingDuration")
+        if not dur or dur <= 0:
+            continue
+        gmt = _gmt_ms(lp.get("startTimeGMT"))
+        start = float(gmt) if gmt is not None else cursor
+        end = start + float(dur) * 1000.0
+        valid.append((start, end, float(dur), lp.get("distance"), lp))
+        cursor = end
+    if not valid:
+        return []
+
+    def _med(arr, sel):
+        v = arr[sel]; v = v[~np.isnan(v)]
+        return float(np.median(v)) if v.size else None
+
+    cores = []
+    for s, e, *_ in valid:
+        cores.append(_med(pace, (ts >= s) & (ts < e) & mask))
+    finite = [c for c in cores if c is not None]
+    med = float(np.median(finite)) if finite else None
+
+    win = LAP_HR_END_WINDOW_S * 1000.0
+    series, prev_work = [], False
+    for k, (s, e, dur, dist, lp) in enumerate(valid):
+        inwin = (ts >= s) & (ts < e)
+        inwin_mv = inwin & mask
+        core = cores[k]
+        is_work = bool(med and core is not None and core < med * LAP_WORK_FRAC)
+        typ = "work" if is_work else ("recovery" if prev_work else "other")
+        hr_win = hr_clean[inwin]; hr_win = hr_win[~np.isnan(hr_win)]
+        pc_win = pace[inwin_mv]; pc_win = pc_win[~np.isnan(pc_win)]
+        hr_end = _med(hr_clean, (ts >= e - win) & (ts <= e))
+        series.append({
+            "lap_index": k + 1, "type": typ, "is_work": is_work,
+            "start_ts_ms": int(s), "end_ts_ms": int(e),
+            "duration_s": round(dur, 1),
+            "distance_m": round(float(dist), 1) if dist else None,
+            "pace_s_per_km": round(core, 1) if core is not None else None,
+            "pace_confidence_iqr": (round(float(np.percentile(pc_win, 75)
+                                    - np.percentile(pc_win, 25)), 1) if pc_win.size >= 4 else None),
+            "hr_avg": round(float(np.median(hr_win)), 1) if hr_win.size else None,
+            "hr_max": round(float(np.percentile(hr_win, 95)), 1) if hr_win.size else None,
+            "hr_end": round(hr_end, 1) if hr_end is not None else None,
+            "cadence": (round(_med(cad, inwin_mv), 1) if _med(cad, inwin_mv) is not None else None),
+            "gct": (round(_med(gct, inwin_mv), 1) if _med(gct, inwin_mv) is not None else None),
+            "stride": (round(_med(stride, inwin_mv), 1) if _med(stride, inwin_mv) is not None else None),
+            "vert_ratio": (round(_med(vr, inwin_mv), 2) if _med(vr, inwin_mv) is not None else None),
+            "is_lactate_lap": False,
+        })
+        prev_work = is_work
+    return series
+
+
+def lap_series(laps, stream) -> list:
+    """Публичная обёртка (garmin_full, на лету): парсит stream → покруговой лог."""
+    rows = (stream or {}).get("activityDetailMetrics") or []
+    descs = (stream or {}).get("metricDescriptors") or []
+    if not rows or not descs or not laps:
+        return []
+    idx = _index_map(stream)
+    ts = _column(rows, idx.get(K_TS))
+    speed = _column(rows, idx.get(K_SPEED))
+    hr = _column(rows, idx.get(K_HR))
+    cad = _column(rows, idx.get(K_CAD))
+    gct = _column(rows, idx.get(K_GCT))
+    vr = _column(rows, idx.get(K_VR))
+    stride = _column(rows, idx.get(K_STRIDE))
+    if ts.size > 1:
+        dt = np.diff(ts, prepend=ts[0]) / 1000.0
+        dt[dt <= 0] = 1.0; dt[np.isnan(dt)] = 1.0
+    else:
+        dt = np.ones(ts.size)
+    mask = _moving_mask(speed, dt)
+    if mask.size != ts.size:
+        mask = np.ones(ts.size, dtype=bool)
+    pace = _pace_s_per_km(speed)
+    hr_valid = _hr_valid_mask(hr, ts)
+    hr_clean = hr.copy(); hr_clean[~hr_valid] = np.nan
+    return _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask)
+
+
+def bind_lactate_work_context(from_watch, series) -> None:
+    """D2: watch-лактат → предшествующий РАБОЧИЙ реп (ФАКТЫ, мутирует объекты на месте).
+    entry_lap = круг ввода; work_ref_lap = ближайший work с end_ts <= метки; + его
+    pace/hr_max; delay_from_work_end_s = (метка − конец репа)/1000. hr/pace секунды укола
+    (entry_*) — НЕ зона замера. block_context НЕ считаем (граница блока — суждение LLM
+    по series)."""
+    if not from_watch or not series:
+        return
+    works = [l for l in series if l["type"] == "work"]
+    for m in from_watch:
+        t = m.get("timestamp_ms")
+        if t is None:
+            continue
+        m["entry_lap"] = m.get("lap")   # переименование смысла (секунда укола)
+        entry = next((l for l in series if l["start_ts_ms"] <= t < l["end_ts_ms"]), None)
+        if entry:
+            entry["is_lactate_lap"] = True
+        prior = [l for l in works if l["end_ts_ms"] <= t]
+        wr = max(prior, key=lambda l: l["end_ts_ms"]) if prior else None
+        if wr:
+            m["work_ref_lap"] = wr["lap_index"]
+            m["work_ref_pace_s_per_km"] = wr["pace_s_per_km"]
+            m["work_ref_hr_max"] = wr["hr_max"]
+            m["delay_from_work_end_s"] = round((t - wr["end_ts_ms"]) / 1000.0, 1)
+
+
+# --------------------------------------------------------------------------- #
 # Резолвер user-меток (этап 7): намерение → секунда потока → привязка.
 # Чистая функция, БЕЗ БД. Зовётся из recompute (батч) и add_lactate (немедленно).
 # --------------------------------------------------------------------------- #
