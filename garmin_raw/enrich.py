@@ -59,7 +59,7 @@ import numpy as np
 # (hr_source/moving_time_s/max_hr), стёртых wipe-багом upsert (fix 7.6-2a'):
 # hr_source в enriched-строках не хранится, только поднимается в каталог put_enriched;
 # перезапись той же версии запрещена (этап 6) -> честный путь восстановления = bump.
-ALGO_VERSION = "enrich-0.6.4"
+ALGO_VERSION = "enrich-0.6.5"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -156,6 +156,9 @@ HR_PACE_BUCKET_BPM = 5             # ширина HR-бакета для pace_by
 #   Различаем no_laps (нет в кэше) / single_lap (один круг, структуры нет) /
 #   no_fast_laps (круги есть, быстрее медианы нет) — три РАЗНЫХ факта (§3.5.2).
 HR_RECOVERY_EDGE_WINDOW_S = 8.0   # окно медианы края recovery (сек); старт 5-10, на калибровку
+HR_RECOVERY_EDGE_MIN_SAMPLES = 3  # мин. сэмплов для медианы РАСШИРЕННОГО окна: медиана
+#                                   отвергает одиночный шип только с >=3 (Q8 э5 — край
+#                                   робастен, не якорь одной точки). База 8с — как было.
 
 # --- Резолвер лактат-меток через MCP (этап 7; ТЗ §6.1, INV-INTENT-VS-BINDING) ----------
 # Единый резолвер намерения (at_time|user_ref) → секунда потока → {lap,hr_at,pace_at}.
@@ -601,19 +604,18 @@ def _decoupling(hr_mv: np.ndarray, pace_mv: np.ndarray, dt_mv: np.ndarray,
     }
 
 
-def _hr_recovery(series: list, ts: np.ndarray, hr_clean: np.ndarray,
-                 laps: Optional[dict] = None) -> dict:
+def _hr_recovery(series: list, laps: Optional[dict] = None) -> dict:
     """Падение HR после рабочих кругов поверх ЕДИНОГО покругового лога (_lap_series).
 
-    D4/D5 (enrich-0.6.4): классификация work/recovery и темп рабочего репа берутся из
-    series — work_pace_core (moving-медиана ЯДРА круга из streams), НЕ 1000/avgSpeed
-    всего круга (тот включал разгонный/тормозной хвост → расхождение с pace_histogram,
-    корень 2.1). Границы кругов — startTimeGMT (истинный wall-clock), не накопление
-    duration от ts[0]. Робастные края HR из streams (медиана последних N сек по
-    wall-clock, НЕ maxHR-пик — §2.4). intensityType Garmin игнорируется (§2.2).
-    Различаем no_laps (нет в кэше) / single_lap (структуры нет) / no_fast_laps
-    (быстрых кругов нет) — три РАЗНЫХ факта (§3.5.2). drop+duration едут фактом,
-    коннектор НЕ судит «быстро ли» (несравнимость длин — суждение LLM).
+    D4/D5 (0.6.4): work/recovery и темп (work_pace_core) — из series. Края HR тоже из
+    series (hr_end + hr_end_window_s — единый источник, D5): start_hr = hr_end рабочего
+    круга, end_hr = hr_end восстановительного. Границы кругов — startTimeGMT (истинный
+    wall-clock). Робастный край — медиана окна, НЕ maxHR-пик (§2.4).
+    edge_window_s (0.6.4-b): фактическое окно измерения края (8с база; шире, если в
+    последних 8с HR разрежён — расширение вместо одиночной точки, Q8 э5). Событие с
+    edge_window_s>8 измерено в иных условиях → НЕ смешивать вслепую с 8с-событиями
+    (демаркация: коннектор отдаёт условия, LLM судит сравнимость — как by_source).
+    Различаем no_laps / single_lap / no_fast_laps (§3.5.2).
     """
     lap_list = (laps or {}).get("lapDTOs") or []
     if not lap_list:
@@ -623,29 +625,25 @@ def _hr_recovery(series: list, ts: np.ndarray, hr_clean: np.ndarray,
     if not any(lp["is_work"] for lp in series):
         return {"events": [], "reason": "no_fast_laps"}
 
-    def median_hr_window(t_start_ms, t_end_ms):
-        sel = (ts >= t_start_ms) & (ts <= t_end_ms)
-        vals = hr_clean[sel]
-        vals = vals[~np.isnan(vals)]
-        return float(np.median(vals)) if vals.size else None
-
-    win = HR_RECOVERY_EDGE_WINDOW_S * 1000.0
+    base = HR_RECOVERY_EDGE_WINDOW_S
     events = []
     for i in range(len(series) - 1):
         cur, nxt = series[i], series[i + 1]
         if not cur["is_work"] or nxt["is_work"]:
             continue   # рабочий круг, за ним НЕ рабочий = восстановление
-        start_hr = median_hr_window(cur["end_ts_ms"] - win, cur["end_ts_ms"])
-        end_hr = median_hr_window(nxt["end_ts_ms"] - win, nxt["end_ts_ms"])
+        start_hr, end_hr = cur["hr_end"], nxt["hr_end"]
         if start_hr is None or end_hr is None:
-            continue
+            continue   # край неизмерим даже расширенным окном → честно пропускаем
+        edge_window_s = max(cur.get("hr_end_window_s") or base,
+                            nxt.get("hr_end_window_s") or base)
         events.append({
-            "start_hr": round(start_hr, 1),
-            "end_hr": round(end_hr, 1),
+            "start_hr": start_hr,
+            "end_hr": end_hr,
             "hr_drop": round(start_hr - end_hr, 1),
             "recovery_duration_s": nxt["duration_s"],
             "work_pace_core": cur["pace_s_per_km"],
             "next_lap_pace": nxt["pace_s_per_km"],
+            "edge_window_s": edge_window_s,
         })
     if not events:
         return {"events": [], "reason": "no_fast_laps"}
@@ -707,6 +705,34 @@ def _gmt_ms(s) -> Optional[int]:
         return None
 
 
+def _edge_hr(ts, hr_clean, end_ms, cap_s) -> tuple:
+    """Робастный край HR у конца круга: медиана в трейлинг-окне [end-w, end].
+    База w=8с (>=1 сэмпл — историческое поведение). Если 8с ПУСТЫ (HR разрежён/пауза) —
+    расширяем шагом 8с до cap_s (длительность круга — не тянуть чужую фазу), беря ПЕРВОЕ
+    окно с >= HR_RECOVERY_EDGE_MIN_SAMPLES сэмплов (медиана, НЕ одиночная точка — Q8 э5).
+    Возвращает (hr, окно_с) либо (None, None). Окно едет фактом edge_window_s."""
+    base = HR_RECOVERY_EDGE_WINDOW_S
+
+    def _vals(w):
+        sel = (ts >= end_ms - w * 1000.0) & (ts <= end_ms)
+        v = hr_clean[sel]
+        return v[~np.isnan(v)]
+
+    v = _vals(base)
+    if v.size >= 1:
+        return round(float(np.median(v)), 1), base
+    cap = max(base, float(cap_s))
+    w = base + HR_RECOVERY_EDGE_WINDOW_S
+    while True:
+        ww = min(w, cap)
+        v = _vals(ww)
+        if v.size >= HR_RECOVERY_EDGE_MIN_SAMPLES:
+            return round(float(np.median(v)), 1), round(ww, 1)
+        if ww >= cap:
+            return None, None
+        w += HR_RECOVERY_EDGE_WINDOW_S
+
+
 def _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask) -> list:
     """Упорядоченный лог кругов. Чистая функция от laps + распарсенных streams.
     type: work (быстрее медианы) / recovery (не-work сразу после work) / other."""
@@ -738,7 +764,6 @@ def _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask) -> list:
     finite = [c for c in cores if c is not None]
     med = float(np.median(finite)) if finite else None
 
-    win = LAP_HR_END_WINDOW_S * 1000.0
     series, prev_work = [], False
     for k, (s, e, dur, dist, lp) in enumerate(valid):
         inwin = (ts >= s) & (ts < e)
@@ -748,7 +773,7 @@ def _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask) -> list:
         typ = "work" if is_work else ("recovery" if prev_work else "other")
         hr_win = hr_clean[inwin]; hr_win = hr_win[~np.isnan(hr_win)]
         pc_win = pace[inwin_mv]; pc_win = pc_win[~np.isnan(pc_win)]
-        hr_end = _med(hr_clean, (ts >= e - win) & (ts <= e))
+        hr_end, hr_end_w = _edge_hr(ts, hr_clean, e, dur)
         series.append({
             "lap_index": k + 1, "type": typ, "is_work": is_work,
             "start_ts_ms": int(s), "end_ts_ms": int(e),
@@ -759,7 +784,8 @@ def _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask) -> list:
                                     - np.percentile(pc_win, 25)), 1) if pc_win.size >= 4 else None),
             "hr_avg": round(float(np.median(hr_win)), 1) if hr_win.size else None,
             "hr_max": round(float(np.percentile(hr_win, 95)), 1) if hr_win.size else None,
-            "hr_end": round(hr_end, 1) if hr_end is not None else None,
+            "hr_end": hr_end,
+            "hr_end_window_s": hr_end_w,
             "cadence": (round(_med(cad, inwin_mv), 1) if _med(cad, inwin_mv) is not None else None),
             "gct": (round(_med(gct, inwin_mv), 1) if _med(gct, inwin_mv) is not None else None),
             "stride": (round(_med(stride, inwin_mv), 1) if _med(stride, inwin_mv) is not None else None),
@@ -1282,7 +1308,7 @@ def enrich_activity(
             (round(float(np.nanvar(pace_mv)), 2) if pace_mv[~np.isnan(pace_mv)].size else None),
             moving_time_s,
         ),
-        "hr_recovery": _hr_recovery(series, ts, hr_clean, laps),
+        "hr_recovery": _hr_recovery(series, laps),
         "lactate_marks": lactate_marks,
         "elevation": {"gain_m": elev_gain, "loss_m": elev_loss},
         "max_hr": (int(round(float(np.nanpercentile(hr_clean, MAX_HR_PERCENTILE))))
@@ -1460,6 +1486,28 @@ if __name__ == "__main__":
     assert "work_pace_core" in ev and "next_lap_pace" in ev, "темпы кругов едут фактом"
     # стартовый HR робастен (медиана последних сек), НЕ задран артефактом-пиком:
     assert 170 <= ev["start_hr"] <= 180, f"старт recovery ≈ конец работы (~175), не пик, got {ev['start_hr']}"
+    assert ev["edge_window_s"] == 8, f"плотный HR → база 8с, got {ev['edge_window_s']}"
+
+    # --- enrich-0.6.4 (b): расширение окна края при разреженном HR + edge_window_s факт ---
+    # рабочий круг [0,100с) быстрый HR~170, НО последние 8с без сэмплов (дыра записи
+    # 92-107с) → база 8с пуста → окно расширяется (не None, не одиночная точка).
+    ts_w = np.concatenate([np.arange(0, 92) * 1000.0, np.arange(108, 200) * 1000.0])
+    speed_w = np.concatenate([np.full(92, 4.5), np.full(92, 2.2)])
+    hr_w = np.concatenate([np.full(92, 170.0), np.full(92, 128.0)]) + rng.normal(0, 0.5, 184)
+    stream_w = {
+        "metricDescriptors": [md("directTimestamp", 0), md("directSpeed", 1), md("directHeartRate", 2)],
+        "activityDetailMetrics": [{"metrics": [ts_w[k], speed_w[k], hr_w[k]]} for k in range(len(ts_w))],
+    }
+    laps_w = {"lapDTOs": [
+        {"duration": 100.0, "averageSpeed": 4.5, "distance": 450.0},
+        {"duration": 100.0, "averageSpeed": 2.2, "distance": 220.0},
+    ]}
+    recw = enrich_activity(stream_w, laps=laps_w)["hr_recovery"]
+    assert recw["reason"] == "ok" and len(recw["events"]) == 1, f"widening: событие есть, got {recw}"
+    evw = recw["events"][0]
+    assert evw["edge_window_s"] > 8, f"край по расширенному окну (>8с), got {evw['edge_window_s']}"
+    assert 168 <= evw["start_hr"] <= 172, f"start_hr робастен по расширенному окну (~170), got {evw['start_hr']}"
+    print("edge-window widening self-test OK")
 
     # --- enrich-0.6.4: offline watch-лактат из кэшированного потока (recompute-lossless) ---
     _lact_stream = {

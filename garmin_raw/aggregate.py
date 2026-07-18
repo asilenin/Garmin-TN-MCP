@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from store import Store
-from enrich import ALGO_VERSION
+from enrich import ALGO_VERSION, HR_RECOVERY_EDGE_WINDOW_S
 
 
 # --- Параметры агрегации (версионируемы вместе с ALGO_VERSION) -----------------
@@ -268,26 +268,39 @@ def _aggregate_hr_recovery(enr_rows: list[dict]) -> dict:
     # потому что drop за 60с и за 120с несравнимы — LLM нормирует по duration сам)
     dur_bins: dict[int, list] = defaultdict(list)
     DUR_EDGES = [0, 30, 60, 90, 120, 1e9]
+    base = HR_RECOVERY_EDGE_WINDOW_S
     for ev in events:
         dur = ev.get("recovery_duration_s")
         drop = ev.get("hr_drop")
         if dur is None or drop is None:
             continue
+        # событие с расширенным окном края (edge_window_s>8) измерено в ИНЫХ условиях
+        # (разреженный HR) — НЕ смешиваем его drop в перцентили 8с-событий (симметрия
+        # by_source: разные условия измерения не пулятся вслепую). Считаем отдельно как
+        # факт доступности, не как порог-классификацию.
+        w = ev.get("edge_window_s")
+        extended = bool(w is not None and w > base)
         bi = _bin_index(dur, DUR_EDGES)
-        dur_bins[bi].append(drop)
+        dur_bins[bi].append((drop, extended))
     by_dur = []
     for i in range(len(DUR_EDGES) - 1):
-        drops = dur_bins.get(i, [])
-        if not drops:
+        items = dur_bins.get(i, [])
+        if not items:
             continue
+        stds = [d for d, e in items if not e]
+        n_ext = sum(1 for d, e in items if e)
         lo, hi = DUR_EDGES[i], DUR_EDGES[i + 1]
-        by_dur.append({
+        entry = {
             "duration_range_s": [lo, None if hi >= 1e8 else hi],  # ось
-            "n_events": len(drops),
-            "drop_p25": round(_percentile(drops, 25), 1),
-            "drop_median": round(_percentile(drops, 50), 1),
-            "drop_p75": round(_percentile(drops, 75), 1),
-        })
+            "n_events": len(stds),          # 8с-события, по ним перцентили ниже
+            "n_extended_window": n_ext,     # измерены расширенным окном; ИСКЛЮЧЕНЫ из
+                                            # перцентилей (иные условия) — факт, не порог
+        }
+        if stds:
+            entry["drop_p25"] = round(_percentile(stds, 25), 1)
+            entry["drop_median"] = round(_percentile(stds, 50), 1)
+            entry["drop_p75"] = round(_percentile(stds, 75), 1)
+        by_dur.append(entry)
     return {
         "events_total": len(events),
         "reason_counts": dict(reason_counts),  # факт доступности, не классификация
