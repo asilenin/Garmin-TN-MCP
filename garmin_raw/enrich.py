@@ -59,7 +59,7 @@ import numpy as np
 # (hr_source/moving_time_s/max_hr), стёртых wipe-багом upsert (fix 7.6-2a'):
 # hr_source в enriched-строках не хранится, только поднимается в каталог put_enriched;
 # перезапись той же версии запрещена (этап 6) -> честный путь восстановления = bump.
-ALGO_VERSION = "enrich-0.6.3"
+ALGO_VERSION = "enrich-0.6.4"
 
 # --- Параметры moving-time (версионируемы; не магические константы в коде) ----
 # Порог остановки по СЫРОЙ скорости (м/с). ~1.35 м/с ≈ темп ~12:20 мин/км —
@@ -601,74 +601,29 @@ def _decoupling(hr_mv: np.ndarray, pace_mv: np.ndarray, dt_mv: np.ndarray,
     }
 
 
-def _hr_recovery(laps: Optional[dict], ts: np.ndarray, hr_clean: np.ndarray,
-                 pace: np.ndarray, speed: np.ndarray) -> dict:
-    """Падение HR после рабочих кругов (быстрее медианы темпа), структурное окно.
+def _hr_recovery(series: list, ts: np.ndarray, hr_clean: np.ndarray,
+                 laps: Optional[dict] = None) -> dict:
+    """Падение HR после рабочих кругов поверх ЕДИНОГО покругового лога (_lap_series).
 
-    Дизайн (длинная калибровка, итог обсуждения этапа 5):
-    - ОКНО СТРУКТУРНОЕ: границы рабочего и следующего круга из laps. НЕ зашитые 60с
-      (§2.5: абсолютный параметр, «почему 60 а не 90» не имеет якорь-нейтрального
-      ответа). Recovery меряется за реальную длительность восстановительного круга.
-    - РОБАСТНЫЕ КРАЯ из streams: стартовый HR = медиана HR последних
-      HR_RECOVERY_EDGE_WINDOW_S секунд рабочего круга (НЕ maxHR-пик — §2.4: единственная
-      точка хрупка, артефактный шип на оптике задрал бы падение). Конечный HR = медиана
-      последних N секунд восстановительного круга (НЕ averageHR всего круга — размазан
-      по падению).
-    - WALL-CLOCK, не moving: пульс реален и в паузе после работы, там начинается
-      восстановление; moving-маска выкинула бы ровно эту точку.
-    - intensityType ИГНОРИРУЕТСЯ (§2.2 чужой ярлык): рабочие круги по темпу.
-    - ОПРЕДЕЛИМОСТЬ (§3.5.2): нужны круги быстрее медианы темпа. no_laps (нет в кэше,
-      чинится дозакачкой) vs no_fast_laps (нет быстрых кругов, честная неопределимость)
-      — РАЗЛИЧАЮТСЯ, не схлопываются в один null.
-    - Коннектор отдаёт drop + duration как ФАКТЫ, НЕ нормирует и НЕ судит «быстро ли».
-      Несравнимость кругов разной длины — суждение LLM: duration едет рядом с drop.
+    D4/D5 (enrich-0.6.4): классификация work/recovery и темп рабочего репа берутся из
+    series — work_pace_core (moving-медиана ЯДРА круга из streams), НЕ 1000/avgSpeed
+    всего круга (тот включал разгонный/тормозной хвост → расхождение с pace_histogram,
+    корень 2.1). Границы кругов — startTimeGMT (истинный wall-clock), не накопление
+    duration от ts[0]. Робастные края HR из streams (медиана последних N сек по
+    wall-clock, НЕ maxHR-пик — §2.4). intensityType Garmin игнорируется (§2.2).
+    Различаем no_laps (нет в кэше) / single_lap (структуры нет) / no_fast_laps
+    (быстрых кругов нет) — три РАЗНЫХ факта (§3.5.2). drop+duration едут фактом,
+    коннектор НЕ судит «быстро ли» (несравнимость длин — суждение LLM).
     """
-    if not laps:
+    lap_list = (laps or {}).get("lapDTOs") or []
+    if not lap_list:
         return {"events": [], "reason": "no_laps"}
-    lap_list = laps.get("lapDTOs") or []
-    if len(lap_list) == 0:
-        return {"events": [], "reason": "no_laps"}
-    if len(lap_list) < 2:
-        # один круг = непрерывный бег без разметки. laps ЕСТЬ, но структуры для
-        # recovery нет. Это НЕ «нет данных» (no_laps, чинится дозакачкой) — это
-        # честная структурная неопределимость, как no_fast_laps (§3.5.2 — различаем).
+    if len(series) < 2:
         return {"events": [], "reason": "single_lap"}
-
-    # границы кругов по wall-clock из startTimeGMT + duration. Если нет — пробуем
-    # восстановить по накоплению duration от ts[0].
-    bounds = []  # (start_ms, end_ms, pace_s_per_km)
-    for lp in lap_list:
-        dur = lp.get("duration") or lp.get("movingDuration")
-        dist = lp.get("distance")
-        spd = lp.get("averageSpeed") or lp.get("averageMovingSpeed")
-        if not dur or dur <= 0:
-            continue
-        # темп круга из avg speed (м/с → сек/км); fallback dist/dur
-        if spd and spd > 0:
-            lp_pace = 1000.0 / spd
-        elif dist and dist > 0:
-            lp_pace = dur / (dist / 1000.0)
-        else:
-            continue
-        bounds.append({"dur": float(dur), "pace": float(lp_pace)})
-    if len(bounds) < 2:
-        # круги есть, но <2 с валидной длительностью/скоростью — структуры нет
-        return {"events": [], "reason": "single_lap"}
-
-    paces = np.array([b["pace"] for b in bounds])
-    med_pace = float(np.median(paces))
-    # рабочие круги = быстрее медианы (меньше сек/км). Строго быстрее, чтобы на
-    # ровном беге (все ~= медиане) не считать всё подряд рабочим.
-    is_work = paces < med_pace * 0.97   # 3% быстрее медианы = заметно рабочий
-
-    # восстановим wall-clock границы кругов: накопление duration от ts[0]
-    t0 = float(ts[0]) if ts.size else 0.0
-    edges = [t0]
-    for b in bounds:
-        edges.append(edges[-1] + b["dur"] * 1000.0)
+    if not any(lp["is_work"] for lp in series):
+        return {"events": [], "reason": "no_fast_laps"}
 
     def median_hr_window(t_start_ms, t_end_ms):
-        """медиана hr_clean в окне [t_start, t_end] по wall-clock (включая не-moving)."""
         sel = (ts >= t_start_ms) & (ts <= t_end_ms)
         vals = hr_clean[sel]
         vals = vals[~np.isnan(vals)]
@@ -676,26 +631,21 @@ def _hr_recovery(laps: Optional[dict], ts: np.ndarray, hr_clean: np.ndarray,
 
     win = HR_RECOVERY_EDGE_WINDOW_S * 1000.0
     events = []
-    for i in range(len(bounds) - 1):
-        if not is_work[i]:
-            continue
-        # следующий круг должен быть медленнее (восстановление), иначе это два
-        # рабочих подряд — не recovery-событие
-        if is_work[i + 1]:
-            continue
-        work_end = edges[i + 1]              # конец рабочего круга (wall-clock)
-        rec_end = edges[i + 2]               # конец восстановительного
-        start_hr = median_hr_window(work_end - win, work_end)
-        end_hr = median_hr_window(rec_end - win, rec_end)
+    for i in range(len(series) - 1):
+        cur, nxt = series[i], series[i + 1]
+        if not cur["is_work"] or nxt["is_work"]:
+            continue   # рабочий круг, за ним НЕ рабочий = восстановление
+        start_hr = median_hr_window(cur["end_ts_ms"] - win, cur["end_ts_ms"])
+        end_hr = median_hr_window(nxt["end_ts_ms"] - win, nxt["end_ts_ms"])
         if start_hr is None or end_hr is None:
             continue
         events.append({
             "start_hr": round(start_hr, 1),
             "end_hr": round(end_hr, 1),
             "hr_drop": round(start_hr - end_hr, 1),
-            "recovery_duration_s": round(bounds[i + 1]["dur"], 1),
-            "work_lap_pace": round(bounds[i]["pace"], 1),
-            "next_lap_pace": round(bounds[i + 1]["pace"], 1),
+            "recovery_duration_s": nxt["duration_s"],
+            "work_pace_core": cur["pace_s_per_km"],
+            "next_lap_pace": nxt["pace_s_per_km"],
         })
     if not events:
         return {"events": [], "reason": "no_fast_laps"}
@@ -872,6 +822,91 @@ def bind_lactate_work_context(from_watch, series) -> None:
             m["work_ref_pace_s_per_km"] = wr["pace_s_per_km"]
             m["work_ref_hr_max"] = wr["hr_max"]
             m["delay_from_work_end_s"] = round((t - wr["end_ts_ms"]) / 1000.0, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Watch-лактат из КЭШИРОВАННОГО потока (offline, БЕЗ сети) — recompute-lossless.
+# ДУБЛЬ схемы developer-поля из backend.py (_LACTATE_DEV_FIELD/_LACTATE_APPIDS/
+# _STRYD_APPID) — ДЕРЖАТЬ В СИНХРОНЕ. backend читает то же из сетевого
+# get_activity_details; здесь — из streams в БД (тот же endpoint кэширован). Без
+# этого offline-пересчёт (recompute) отдавал бы lact=[] и ЗАТИРАЛ from_watch.
+# --------------------------------------------------------------------------- #
+LACTATE_DEV_FIELD = 1
+LACTATE_APPIDS = {
+    "00000000-0000-0000-0000-000000000000",   # sideload (Garmin зануляет appID)
+    "76c7981c-29ee-4a5a-8af0-e97eb4a2a9fc",   # TN Splits View (Garmin Store)
+}
+LACTATE_STRYD_APPID = "18fb2cf0-1a4b-430d-ad66-988c847421f4"   # поле Stryd — исключаем
+
+
+def _lactate_lap_bounds(laps) -> list:
+    """[(start_ms, end_ms, lap_no)] по startTimeGMT+duration (как _lap_series)."""
+    out, cursor = [], None
+    for n, lp in enumerate((laps or {}).get("lapDTOs") or [], 1):
+        dur = lp.get("duration") or lp.get("movingDuration")
+        if not dur or dur <= 0:
+            continue
+        gmt = _gmt_ms(lp.get("startTimeGMT"))
+        start = float(gmt) if gmt is not None else cursor
+        if start is None:
+            continue
+        end = start + float(dur) * 1000.0
+        out.append((start, end, n))
+        cursor = end
+    return out
+
+
+def lactate_from_stream(stream, laps) -> list:
+    """Watch-лактат (developer-поле #1) ИЗ КЭШИРОВАННОГО потока, БЕЗ сети.
+    Зеркало backend.get_activity_lactate для offline-пересчёта: тот же endpoint
+    (get_activity_details) уже в БД как 'streams'. Возвращает points
+    [{timestamp_ms, mmol, distance_m, lap}] — вход lactate_watch_points у
+    enrich_activity. Отметка = сэмпл со значением > 0 (0 = нет замера)."""
+    descs = (stream or {}).get("metricDescriptors") or []
+    rows = (stream or {}).get("activityDetailMetrics") or []
+    if not descs or not rows:
+        return []
+    lact_idx = ts_idx = dist_idx = None
+    for m in descs:
+        key = m.get("key")
+        if key == K_TS:
+            ts_idx = m.get("metricsIndex")
+        elif key == K_DIST:
+            dist_idx = m.get("metricsIndex")
+        appid = m.get("appID")
+        if (m.get("developerFieldNumber") == LACTATE_DEV_FIELD
+                and appid != LACTATE_STRYD_APPID
+                and (appid in LACTATE_APPIDS or appid is None)):
+            lact_idx = m.get("metricsIndex")
+    if lact_idx is None:
+        return []
+    bounds = _lactate_lap_bounds(laps)
+
+    def _lap_for(ts):
+        if ts is None:
+            return None
+        for st_ms, en_ms, n in bounds:
+            if st_ms <= ts < en_ms:
+                return n
+        return None
+
+    points = []
+    for row in rows:
+        mv = row.get("metrics", [])
+        if len(mv) <= lact_idx:
+            continue
+        val = mv[lact_idx]
+        if val is None or val <= 0:
+            continue
+        ts = mv[ts_idx] if (ts_idx is not None and len(mv) > ts_idx) else None
+        dist = mv[dist_idx] if (dist_idx is not None and len(mv) > dist_idx) else None
+        points.append({
+            "timestamp_ms": ts,
+            "mmol": round(float(val), 2),
+            "distance_m": round(dist) if dist else None,
+            "lap": _lap_for(ts),
+        })
+    return points
 
 
 # --------------------------------------------------------------------------- #
@@ -1221,6 +1256,8 @@ def enrich_activity(
         lactate_marks = {"from_watch": watch, "from_comment": comment,
                          "count_watch": len(watch)}
 
+    series = _lap_series(laps, ts, pace, hr_clean, cad, gct, vr, stride, mask)
+
     return {
         "algo_version": ALGO_VERSION,
         "moving_time_s": round(moving_time_s, 1),
@@ -1245,7 +1282,7 @@ def enrich_activity(
             (round(float(np.nanvar(pace_mv)), 2) if pace_mv[~np.isnan(pace_mv)].size else None),
             moving_time_s,
         ),
-        "hr_recovery": _hr_recovery(laps, ts, hr_clean, pace, speed),
+        "hr_recovery": _hr_recovery(series, ts, hr_clean, laps),
         "lactate_marks": lactate_marks,
         "elevation": {"gain_m": elev_gain, "loss_m": elev_loss},
         "max_hr": (int(round(float(np.nanpercentile(hr_clean, MAX_HR_PERCENTILE))))
@@ -1420,9 +1457,36 @@ if __name__ == "__main__":
     ev = rec["events"][0]
     assert ev["hr_drop"] > 20, f"HR должен упасть с ~175 до ~130, drop={ev['hr_drop']}"
     assert ev["recovery_duration_s"] == 100.0, "длительность восстановительного круга — факт"
-    assert "work_lap_pace" in ev and "next_lap_pace" in ev, "темпы кругов едут фактом"
+    assert "work_pace_core" in ev and "next_lap_pace" in ev, "темпы кругов едут фактом"
     # стартовый HR робастен (медиана последних сек), НЕ задран артефактом-пиком:
     assert 170 <= ev["start_hr"] <= 180, f"старт recovery ≈ конец работы (~175), не пик, got {ev['start_hr']}"
+
+    # --- enrich-0.6.4: offline watch-лактат из кэшированного потока (recompute-lossless) ---
+    _lact_stream = {
+        "metricDescriptors": [
+            {"key": "directTimestamp", "metricsIndex": 0},
+            {"key": "sumDistance", "metricsIndex": 1},
+            {"developerFieldNumber": 1, "appID": "76c7981c-29ee-4a5a-8af0-e97eb4a2a9fc",
+             "metricsIndex": 2},
+        ],
+        "activityDetailMetrics": [
+            {"metrics": [1000.0, 100.0, 0.0]},
+            {"metrics": [2000.0, 103.0, 4.4]},
+            {"metrics": [3000.0, 106.0, 0.0]},
+        ],
+    }
+    _lp = lactate_from_stream(_lact_stream, None)
+    assert len(_lp) == 1 and _lp[0]["mmol"] == 4.4 and _lp[0]["timestamp_ms"] == 2000.0, \
+        f"offline watch-лактат: 4.4 на секунде 2000, got {_lp}"
+    _stryd = {
+        "metricDescriptors": [
+            {"key": "directTimestamp", "metricsIndex": 0},
+            {"developerFieldNumber": 1, "appID": "18fb2cf0-1a4b-430d-ad66-988c847421f4",
+             "metricsIndex": 1}],
+        "activityDetailMetrics": [{"metrics": [1000.0, 5.5]}],
+    }
+    assert lactate_from_stream(_stryd, None) == [], "поле Stryd #1 НЕ лактат (исключается)"
+    print("offline-лактат self-test OK")
 
     # --- этап 7: resolve_mark (намерение → секунда потока → привязка) ---
     # чистый поток 300с от базового эпоха, 1 сэмпл/с; speed рампа, hr рампа.

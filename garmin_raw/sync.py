@@ -318,6 +318,9 @@ def enrich_batch(slug: str, *, limit: int = 200, start: Optional[str] = None,
                             st.put_raw(aid, "laps", fetcher.get_laps(aid))
                         except Exception:  # noqa: BLE001
                             pass
+                # laps (структура кругов): нужно hr_recovery И привязку lap watch-лактата
+                # (offline). Один раз из БД (online докачан выше при первом streams).
+                laps = st.get_raw(aid, "laps")
                 # лактат двумя дорогами (обе необязательны)
                 lact, comment = [], []
                 if not offline:
@@ -333,14 +336,14 @@ def enrich_batch(slug: str, *, limit: int = 200, start: Optional[str] = None,
                     except Exception:  # noqa: BLE001
                         comment = []
                 else:
-                    # offline: лактат из сохранённого comment-сырья, если оно есть в БД
+                    # offline: watch-лактат из КЭШИРОВАННОГО потока (get_activity_details
+                    # уже в БД как 'streams') — recompute БЕЗ сети и БЕЗ потери from_watch;
+                    # comment-лактат из сохранённого comment-сырья, если оно есть в БД
+                    from enrich import lactate_from_stream
+                    lact = lactate_from_stream(stream, laps)
                     craw = st.get_raw(aid, "comment")
                     if isinstance(craw, dict):
                         comment = craw.get("lactate_mmol", []) or []
-                # laps — второе несущее сырьё (структура кругов): нужно hr_recovery.
-                # Кэшированы для всех (долг закрыт); offline берём из БД, online —
-                # докачиваем выше при первом скачивании streams.
-                laps = st.get_raw(aid, "laps")
                 # sport из каталога → gps_type (согласован с ЭТИМ aid)
                 _sp = st.conn.execute("SELECT sport FROM activities WHERE activity_id=?",
                                       (aid,)).fetchone()
