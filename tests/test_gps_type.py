@@ -59,7 +59,7 @@ def test_consistency_with_catalog() -> None:
 
 
 def test_version_bumped() -> None:
-    assert ALGO_VERSION == "enrich-0.6.3", ALGO_VERSION
+    assert ALGO_VERSION == "enrich-0.6.5", ALGO_VERSION
     print(f"  ALGO_VERSION = {ALGO_VERSION} (bump под gps_type) OK")
 
 
